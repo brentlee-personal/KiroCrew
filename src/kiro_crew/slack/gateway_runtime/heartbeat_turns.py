@@ -214,6 +214,9 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
                     approval_policy=ToolApprovalPolicy.HOOK_BASED,
                     hooks=heartbeat_hooks,
                     on_tool_approval=self._heartbeat_approval,
+                    # Nobody watches a heartbeat task: a governance check that
+                    # cannot be evaluated refuses the call.
+                    unattended=True,
                     on_complete=_note_complete,
                     on_compaction=_note_compaction,
                     fallback_models=configured_fallback_chain(),
@@ -226,7 +229,9 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
 
             if not result_text:
                 result_text = "_No response._"
-            result_text = _annotate_model_fallback(result_text, client)
+            result_text = _annotate_model_fallback(
+                result_text, client, stop_reason=_turn_stop["reason"]
+            )
 
             # ── Per-turn usage row: attribute heartbeat spend. ──
             await _persist_turn_row(
@@ -299,7 +304,7 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
                 # Release the per-session semaphore so the next task in
                 # this cycle (asyncio.gather'd) can acquire the SAME
                 # warm session.  Cycle-end teardown is handled by
-                # ``_recycle_heartbeat`` (called once after gather
+                # ``recycle_heartbeat`` (called once after gather
                 # completes) — see ``HeartbeatService._process_heartbeat_file``.
                 self.sessions.release(session_key)
 

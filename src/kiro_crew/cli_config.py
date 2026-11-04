@@ -27,6 +27,7 @@ from kiro_crew.config.resolution import _SECTION_KEYS_EMITTED_ELSEWHERE
 from kiro_crew.config.sections import _migrate_workspaces, _sanitize_bot_name
 from kiro_crew.config.sections_tailnet import TAILNET_OPENING_PATHS
 from kiro_crew.config.superseded_defaults import (
+    ack_explicit_write,
     acked_superseded,
     adopt_coerced_keys,
     adopted_superseded,
@@ -39,6 +40,7 @@ from kiro_crew.config.superseded_defaults import (
     record_acks,
     superseded_default_drift,
 )
+from kiro_crew.config.write_provenance import record_path
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.sel import sel
 
@@ -54,7 +56,7 @@ _SEALED_CONFIG_ERRNOS = frozenset({errno.EPERM, errno.EACCES, errno.EROFS, errno
 
 
 def _names_sealed_config(exc: OSError) -> bool:
-    """Whether *exc* was raised against ``config.json`` or ``config.local.json``.
+    """Whether *exc* was raised against ``config.json``, ``config.local.json`` or its record.
 
     The publishing ``os.replace(tmp, path)`` reports the temp as ``filename`` and the
     destination as ``filename2``; an in-place ``open(path, "w")`` reports only
@@ -62,7 +64,9 @@ def _names_sealed_config(exc: OSError) -> bool:
     neither -- ``config edit``'s ``execvp`` of an editor, a temp the data home itself
     refused -- is the caller's to report as what it is.
     """
-    sealed = {os.path.realpath(p) for p in (config_path(), config_local_path())}
+    # The config writer records each save in the publication record first, and that
+    # record is sealed the same way, so a sandboxed save is refused there.
+    sealed = {os.path.realpath(p) for p in (config_path(), config_local_path(), record_path())}
     for name in (exc.filename, exc.filename2):
         if isinstance(name, (str, bytes, os.PathLike)):
             if os.path.realpath(os.fsdecode(name)) in sealed:
@@ -119,6 +123,18 @@ def _refuse_missing_workspace_dirs(data: dict, current: dict) -> dict:
                 f"workspace {name!r}: dir {entry.dir!r} is not an existing directory"
             )
     return data
+
+
+def _ack_explicit_config_write(key: str, value: object) -> None:
+    """Ack only submitted keys, including children of a whole-section write.
+
+    Called under the destination config lock, before publication. Let an ack
+    refusal abort the write rather than save a choice the next load would adopt.
+    """
+    ack_explicit_write(key, value)
+    if isinstance(value, dict):
+        for child, child_value in value.items():
+            _ack_explicit_config_write(f"{key}.{child}", child_value)
 
 
 def _warn_if_bot_name_altered(key: str, parsed: object) -> None:
@@ -219,10 +235,17 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+
+            def _mutate_from_file(cur: dict) -> dict:
+                _refuse_missing_workspace_dirs(data, cur)
+                for key, value in data.items():
+                    _ack_explicit_config_write(key, value)
+                return data
+
             try:
                 update_config_locked(
                     config_path(),
-                    mutate=lambda cur: _refuse_missing_workspace_dirs(data, cur),
+                    mutate=_mutate_from_file,
                     on_corrupt="reset",
                 )
             except ConfigWriteRefused as e:
@@ -300,6 +323,24 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     )
                     sys.exit(1)
                 parsed = threads
+            # The failover block is refused here rather than logged and read as
+            # off at load, for the same reason. Written whole, so its parts are
+            # always checked together.
+            if key.startswith("agent.acp_failover."):
+                print(
+                    "❌ agent.acp_failover is set as one object, e.g. "
+                    '\'{"enabled": true, "chain": ["codex", "claude"]}\'',
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if key == "agent.acp_failover":
+                from kiro_crew.config.sections_agent_fields import validate_acp_failover
+
+                try:
+                    parsed = validate_acp_failover(parsed)
+                except ValueError as failover_error:
+                    print(f"❌ {key}: {failover_error}", file=sys.stderr)
+                    sys.exit(1)
             # Fourth write path to telemetry.beacon_enabled, after the dashboard
             # PATCH and `telemetry enable`. Gated here too, and BEFORE the
             # local/base split so it covers both: `--local` writes the overlay,
@@ -366,6 +407,7 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     # are the ones this write really removed.
                     dropped[:] = _overlay_keys_dropped(_dict_get(_existing, key), parsed, key)
                     _dict_set_create(_existing, key, parsed)
+                    _ack_explicit_config_write(key, parsed)
                     return _existing
 
                 try:
@@ -397,13 +439,14 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     # sections that were never written (still at defaults) get
                     # their intermediate keys created.
                     _dict_set_create(existing, key, parsed)
+                    _ack_explicit_config_write(key, parsed)
                     lp = config_local_path()
                     if lp.is_file():
                         try:
                             raw_local = json.loads(read_config_text(lp))
                             if isinstance(raw_local, dict):
                                 return _subtract_overlay(existing, raw_local)
-                        except (json.JSONDecodeError, OSError):
+                        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                             pass
                     return existing
 

@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.agent_files import is_kirocrew_default_agent
 from kiro_crew.agent_sdk.spec_hooks import (
+    OverlongHookCommand,
     crew_fired_spec_hooks,
+    merge_user_hook_files,
+    overlong_spec_hook_commands,
+    project_hook_files_present,
     session_agent,
     spec_hook_events,
     spec_hooks_run_nowhere,
@@ -68,6 +72,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.tool_approval import (
         _SPEC_HOOKS_UNREADABLE_BLOCK,
         _credential_tool_hint_for,
+        _project_hook_files_notice,
         _spec_confirm_hooks_notice,
         _spec_hooks_run_nowhere_notice,
         _spec_keys_notice,
@@ -178,6 +183,10 @@ async def _prepare_spec_hooks(
         logger.warning("no agent is known for this KAS session; tool calls are blocked")
         return [], True, work_dir
     try:
+        # A crewmate's worker fires its session's merged spec: the
+        # session this turn holds, set at admission.
+        held = getattr(slot, "_active_turn_session_key", "")
+        by_session = {"session_key": held} if isinstance(held, str) and held else {}
         hooks, lost, unconfirmable = await asyncio.to_thread(
             functools.partial(
                 crew_fired_spec_hooks,
@@ -185,6 +194,7 @@ async def _prepare_spec_hooks(
                 spec_project_dir(client),
                 # Only KAS receives `toolsSettings` as `permissions` rules.
                 translates_tools_settings=capabilities_of(client).backend == ACP_BACKEND_KAS,
+                **by_session,
             )
         )
     except Exception:  # noqa: BLE001 - the caller fails PreToolUse closed
@@ -194,6 +204,22 @@ async def _prepare_spec_hooks(
             exc_info=True,
         )
         return [], True, work_dir
+    # Whether the agent spec's OWN hooks run, captured before the user's
+    # standalone files are folded in: the withheld-project-spec notice reports
+    # whether the user-level SPEC carries hooks that run, which the standalone
+    # files are not.
+    spec_hooks_run = bool(hooks)
+    # The user's standalone ~/.kiro/hooks/*.json files run on KAS, folded in
+    # through the one seam every KAS turn uses (dashboard, sub-agent, task-runner),
+    # so a read/parse failure degrades to fewer hooks rather than failing the turn,
+    # a JSON hook whose command is an autoimported *.sh is not fired twice, and the
+    # auto-approve withhold always has a hook to fire. Returns the spec hooks
+    # unchanged off KAS (goose and opencode do not read a user's standalone files).
+    is_kas = capabilities_of(client).backend == ACP_BACKEND_KAS
+    try:
+        hooks = await asyncio.to_thread(merge_user_hook_files, client, hooks)
+    except Exception:  # noqa: BLE001 - a hook-file read must never fail a turn
+        logger.debug("user hook files could not be merged; none added", exc_info=True)
     if is_new and lost:
         append_and_surface(
             state,
@@ -211,12 +237,112 @@ async def _prepare_spec_hooks(
             "msg msg-info",
         )
     if is_new:
+        await _surface_overlong_hook_commands(
+            state, slot, agent, spec_project_dir(client), by_session.get("session_key", "")
+        )
+    if is_new:
         # A withheld project spec yields the user-level spec in its place, so
         # these hooks are exactly the user-level ones that still run.
         await _surface_withheld_project_hooks(
-            state, slot, client, agent, user_hooks_run=bool(hooks)
+            state, slot, client, agent, user_hooks_run=spec_hooks_run
         )
+        # Standalone <project>/.kiro/hooks/*.json files are not run either, on the
+        # same trust verdict Crew cannot read for a checkout. Say so when
+        # such files exist, so they are never withheld silently. KAS only, to match
+        # where the user files now run.
+        if is_kas:
+            await _surface_withheld_project_hook_files(state, slot, client)
     return hooks, False, work_dir
+
+
+#: How many too-long hooks the notice names before it counts the rest.
+_OVERLONG_NOTICE_ENTRIES = 3
+
+
+def _overlong_hook_commands_notice(agent: str, hooks: list[OverlongHookCommand]) -> str:
+    """The session-start notice for spec hooks whose command is over the length limit."""
+    shown = []
+    for hook in hooks[:_OVERLONG_NOTICE_ENTRIES]:
+        # Redact each whole value before the cut, as the steering notice does.
+        label = _redact_display_text(hook.event)[:64]
+        if hook.matcher:
+            label += f" (matcher {_redact_display_text(hook.matcher)[:64]})"
+        shown.append(f"{label}: {hook.length:,} characters, limit {hook.limit:,}")
+    text = "; ".join(shown)
+    more = len(hooks) - _OVERLONG_NOTICE_ENTRIES
+    if more > 0:
+        text += f"; and {more} more"
+    noun = "hook does" if len(hooks) == 1 else "hooks do"
+    return (
+        f"ℹ Agent {agent}: {len(hooks)} {noun} not run because the command is too "
+        f"long ({text}). Put the logic in a script file and call that script from "
+        "the hook."
+    )
+
+
+async def _surface_overlong_hook_commands(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    agent: str,
+    project_dir: str | None,
+    session_key: str,
+) -> None:
+    """One notice row naming the spec hooks dropped for a command over the length limit.
+
+    Best-effort: a spec that cannot be read renders no row rather than failing the turn.
+    """
+    by_session = {"session_key": session_key} if session_key else {}
+    try:
+        hooks = await asyncio.to_thread(
+            functools.partial(overlong_spec_hook_commands, agent, project_dir, **by_session)
+        )
+    except Exception:  # noqa: BLE001 - an informational row must never fail a turn
+        logger.debug("too-long spec hooks for %r could not be read", agent, exc_info=True)
+        return
+    if hooks:
+        append_and_surface(
+            state,
+            slot,
+            "notice",
+            _redact_display_text(_overlong_hook_commands_notice(agent, hooks)),
+            "msg msg-info",
+            meta={"kind": SPEC_HOOKS_NOTICE_KIND},
+        )
+
+
+async def _surface_withheld_project_hook_files(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    client: Any,
+) -> None:
+    """One notice row when the checkout has standalone ``.kiro/hooks/*.json`` files.
+
+    These do not run in a dashboard session: Crew cannot read this backend's
+    workspace-trust verdict for a checkout, so it runs no command from one. The
+    user's own ``~/.kiro/hooks/*.json`` files DO run. Shown only when such project
+    files exist. The checkout is the session's OWN working directory (``client.cwd``)
+    rather than ``spec_project_dir``, which answers ``None`` on KAS (KAS resolves its
+    agent spec from the user level alone), so the notice would otherwise never fire.
+    Best-effort: a failed check renders nothing rather than failing the turn.
+    """
+    cwd = getattr(client, "cwd", "")
+    project_dir = cwd if isinstance(cwd, str) and cwd else None
+    if not project_dir:
+        return
+    try:
+        present = await asyncio.to_thread(project_hook_files_present, project_dir)
+    except Exception:  # noqa: BLE001 - a notice must never fail a turn
+        logger.debug("could not check %s for project hook files", project_dir, exc_info=True)
+        return
+    if present:
+        append_and_surface(
+            state,
+            slot,
+            "notice",
+            _redact_display_text(_project_hook_files_notice()),
+            "msg msg-info",
+            meta={"kind": SPEC_HOOKS_NOTICE_KIND},
+        )
 
 
 async def _notice_spec_hooks_run_nowhere(
@@ -302,8 +428,8 @@ async def _notice_unread_steering(
 
 def _notice_steer_upgrade(state: "DashboardState", slot: "_ChatSlot", client: Any) -> None:
     """One notice row on a new session whose adapter is too old to take a mid-turn
-    message, one whose KAS drops its agent's prompt, and one whose goose is outside
-    its tested range: the chat runs, and each row names the installed version, the
+    message, one whose KAS drops its agent's prompt, and one whose goose or codex is
+    outside its tested range: the chat runs, and each row names the installed version, the
     tested one and the command that installs it."""
     for name in ("steer_upgrade_notice", "agent_prompt_upgrade_notice", "tested_version_notice"):
         notice = getattr(client, name, "")

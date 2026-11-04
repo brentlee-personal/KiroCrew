@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.drivers.acp_vocab import EngineFallbackWalk
 from kiro_crew.dashboard.poisoned_escalation import PoisonedConversationEscalation
 from kiro_crew.dashboard.state import SUBAGENT_SYNTHESIS_PROMPT, row_mid
 from kiro_crew.llm_helpers import _NO_PRIOR_STATS
@@ -373,6 +374,14 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     #: message, which can carry a path or a credential.
     _crew_log_error = ""
     turn._crew_log_error = _crew_log_error
+
+    #: The body of the dead-turn bell entry, set by a terminal
+    #: non-retry error arm (stop-reason or exception) to the one-line text for
+    #: the operator; None when the turn did not end in a death that needs them.
+    #: The finally closer reads it and fires the note ONCE, so the bell is wired
+    #: at a single choke point and a future terminal arm is covered by setting
+    #: this flag rather than by remembering a scattered call.
+    turn.died_notice = None
 
     # Time-to-first-token clock: starts when the user's message reaches the
     # runner, stops at the first visible model output (text OR thinking chunk).
@@ -927,6 +936,10 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # teardown before that, so it must be bound up front.
     _stop_reason = ""
     turn._stop_reason = _stop_reason
+    # The engine's own fallback hops this turn (acp/engine_fallback.py). Bound up
+    # front for the same reason: _run_chat's finally ends the walk with a notice.
+    _engine_fallback_walk = EngineFallbackWalk()
+    turn._engine_fallback_walk = _engine_fallback_walk
     # Replay settlement also lives in _turn_settle_debts. Bind at turn scope because
     # config, binding and session-start failures can reach teardown before the
     # acquisition block in _turn_admit determines whether replay is pending.

@@ -16,7 +16,7 @@ import os
 import shutil
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator
 
@@ -131,6 +131,8 @@ def install_app(
     *,
     expected_name: str | None = None,
     source_repository: str = "",
+    market_source: str = "",
+    source_commit: str = "",
 ) -> AppResult:
     """Install an app from a local directory path.
 
@@ -140,7 +142,25 @@ def install_app(
 
     Resource registration (agents, skills, crons) is handled separately
     by the bridge module — this function only manages files.
+
+    ``market_source`` (``market:<ref>@<n>``) marks a marketplace install. It is
+    written by the FIRST durable record write, with ``origin = "local"`` and
+    ``sourceCommit = source_commit``, so no record ever names the staging folder
+    as the source of marketplace code; a local-folder grant would admit that.
+    The install-time trust check then compares against the listing coordinate.
     """
+    market_coordinate = ""
+    if market_source:
+        # Imported here so the manager facade's star import gains no new names.
+        from kiro_crew.apps.market_source import market_trust_coordinate
+
+        market_coordinate = market_trust_coordinate(market_source)
+        if not market_coordinate or source_repository:
+            return AppResult(
+                ok=False,
+                error="invalid marketplace source",
+                error_code="market_source_invalid",
+            )
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
         sel().log_api_access(
@@ -231,7 +251,9 @@ def install_app(
         )
 
     source_repository = _effective_source_repository(source_repository)
-    trust_denied = repository_bound_grant_denied(name, repository=source_repository)
+    trust_denied = repository_bound_grant_denied(
+        name, repository=market_coordinate or source_repository
+    )
     if trust_denied:
         sel().log_api_access(
             caller="app_install",
@@ -408,12 +430,14 @@ def install_app(
         sessionApprovalConsentPending=bool(manifest.permissions.sessionApproval),
         approvedGrantsStored=True,
         installedAt=_now_iso(),
-        source=str(source),
+        source=market_source or str(source),
+        origin="local" if market_source else InstalledApp.origin,
         # Persist the server-resolved repository at the first durable metadata
         # write.  The registry's richer set_app_provenance bookkeeping happens
         # later and may fail after the copied app is already the live occupant;
         # runtime admission must still remain bound to what was installed.
         sourceUrl=source_repository.strip(),
+        sourceCommit=source_commit if market_source else "",
     )
     # Installing is the consent moment for everything the manifest declares.
     # Written before the record, so no record ever sits beside a missing set.
@@ -452,12 +476,21 @@ def install_app(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class AdoptionProvenance:
+    """The registry coordinate a former built-in record is adopted onto (``manager_adopt``)."""
+
+    repository: str
+    commit: str
+
+
 @holds_app_record_locks
 def update_app(
     source: str | Path,
     *,
     expected_name: str | None = None,
     source_repository: str = "",
+    _adoption: AdoptionProvenance | None = None,
 ) -> AppResult:
     """Update an already-installed app from a local directory path.
 
@@ -469,6 +502,13 @@ def update_app(
     ``expected_name``: when given, reject the update unless the source
     manifest's ``name`` matches — callers that lock/route by app name must
     not let a mismatched source mutate a different app.
+
+    ``_adoption`` is set only by ``manager_adopt.adopt_builtin_record``: the
+    builtin-owned record becomes a registry record of *repository* at *commit*
+    (``origin=registry``, ``lifecycle=gateway``) in the same transaction. It is
+    refused BEFORE anything is mutated unless the record is builtin-owned and the
+    new manifest neither holds back a grant nor adds ``sessionApproval``, so an
+    adopted app keeps its ``enabled`` flag and every approved grant.
     """
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
@@ -552,6 +592,23 @@ def update_app(
         new_permissions=grant_source(manifest),
     )
     widened_grants = any(_held_back_entries(approved_grants, grant_source(manifest)).values())
+    if _adoption is not None:
+        # Same discriminator as ``manager_builtins._builtin_owns_install`` (a later
+        # owner, so not importable here): only ``register_builtin_apps`` writes it.
+        if not (existing.source == "builtin" or existing.origin == "builtin"):
+            return AppResult(
+                ok=False,
+                name=name,
+                error=f"app {name!r} is not a built-in record",
+                error_code="not_builtin_owned",
+            )
+        if widened_session_approval or widened_grants:
+            return AppResult(
+                ok=False,
+                name=name,
+                error="the repository version requests permissions the built-in did not hold",
+                error_code="adoption_would_widen",
+            )
 
     # Carry every persisted field forward from ``existing``, overriding only
     # what the update changes. Keeping this metadata inside the file transaction
@@ -574,6 +631,17 @@ def update_app(
         sourceSigner="",
         approvedGrantsStored=True,
     )
+    if _adoption is not None:
+        meta = replace(
+            meta,
+            source=f"registry:{name}",
+            origin="registry",
+            resources="gateway",
+            lifecycle="gateway",
+            migratedTo="",
+            sourceUrl=_adoption.repository,
+            sourceCommit=_adoption.commit,
+        )
     # Preserve data directory and app secret
     data_dir = dest / "data"
     secret_file = dest / ".app_secret"
@@ -712,7 +780,10 @@ def update_app(
 
     # Ensure data directory exists
     app_data_dir(name)
-    refresh_app_config_keys()
+    # An adoption runs on the boot path before ``register_builtin_apps``, which
+    # publishes every record's config keys before the dashboard serves.
+    if _adoption is None:
+        refresh_app_config_keys()
 
     logger.info(
         "Updated app %s: v%s -> v%s from %s",

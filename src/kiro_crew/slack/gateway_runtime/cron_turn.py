@@ -53,6 +53,7 @@ if TYPE_CHECKING:
         context_meter_reading,
         dataclass,
         declared_mcp_not_ready_note,
+        engine_attributed_model,
         logger,
         note_turn_landed,
         persist_token_record_async,
@@ -243,7 +244,10 @@ async def _cron_run_sequence(
                     is_new,
                     agent_session_key,
                     interactive=False,
-                    agent=agent,
+                    # The execution template, as dispatched: a crew
+                    # alias names no template file, and a private
+                    # crewmate's essentials refuse a missing one.
+                    agent=step.dispatch_agent,
                     memory_store=cron_memory_store or None,
                     execution_context=cron_execution,
                     context_provider=client,
@@ -262,6 +266,10 @@ async def _cron_run_sequence(
                     full_message,
                     job_name=job.name,
                     on_resume=lambda: settle_turn(self.sessions, agent_session_key),
+                    # The gate resolves this session's governance profile, as it
+                    # does for a chat turn, and refuses when it cannot evaluate.
+                    session_key=agent_session_key,
+                    unattended=True,
                     approval_policy=(
                         ToolApprovalPolicy.AUTO_APPROVE
                         if job.approval_mode == "auto"
@@ -285,7 +293,9 @@ async def _cron_run_sequence(
                     note_turn_landed(self.sessions, agent_session_key)
                 if not result_text:
                     result_text = _gate.empty_reply_placeholder()
-                result_text = _annotate_model_fallback(result_text, client)
+                result_text = _annotate_model_fallback(
+                    result_text, client, stop_reason=_seq_stop["reason"]
+                )
                 _seq_missing = declared_mcp_not_ready_note(client)
                 if _seq_missing:
                     _seq_mcp_notes.append(f"⚠ {agent}: {_seq_missing}.")
@@ -309,14 +319,16 @@ async def _cron_run_sequence(
                         # that never executed. Blank defers to
                         # model_source, which reports what actually ran.
                         # A half-applied pair pin bills the bare
-                        # model that ran, not the suffixed pin.
+                        # model that ran, not the suffixed pin, and an
+                        # engine fallback bills the model it moved to.
                         (
                             ""
                             if (_seq_downgraded or provider_fallback_active(client))
-                            else (
+                            else engine_attributed_model(
                                 (job.model and provider_model_pin_partial(client))
                                 or job.model
-                                or ""
+                                or "",
+                                client,
                             )
                         ),
                         _turn_usage,
@@ -630,6 +642,9 @@ async def _cron_run_single(
             # Unattended: hold the first prompt (bounded) for the agent spec's
             # MCP servers, which nobody can reconnect by hand in this run.
             await wait_for_declared_mcp(client, UNATTENDED_MCP_WAIT_SECS)
+        # Skill triggers read the job's own prompt: the acknowledged-items list
+        # below is Kiro Crew's text, so its words must not load or veto a skill.
+        trigger_text = msg
         if job.acked_items:
             msg += (
                 "\n\n[User has seen and acknowledged ALL of the following — "
@@ -647,7 +662,8 @@ async def _cron_run_single(
             is_new,
             session_key,
             interactive=False,
-            agent=cron_agent or None,
+            # The execution template, as dispatched (see the sequence site).
+            agent=_dispatch_agent,
             memory_store=cron_memory_store or None,
             execution_context=cron_execution,
             context_provider=client,
@@ -657,6 +673,7 @@ async def _cron_run_single(
             minimal_context=job.minimal_context,
             # The previous run's result, framed as data, ahead of the request.
             request_prefix_context=cap.prior_result or None,
+            skill_trigger_text=trigger_text,
         )
 
         # Wall clock for the cron agent turn — see the sequential site
@@ -669,6 +686,10 @@ async def _cron_run_single(
             full_message,
             job_name=job.name,
             on_resume=lambda: settle_turn(self.sessions, session_key),
+            # The gate resolves this session's governance profile, as it does
+            # for a chat turn, and refuses when it cannot evaluate.
+            session_key=session_key,
+            unattended=True,
             approval_policy=(
                 ToolApprovalPolicy.AUTO_APPROVE
                 if job.approval_mode == "auto"
@@ -702,7 +723,9 @@ async def _cron_run_single(
 
         if _model_downgraded:
             result_text = _annotate_model_downgrade(job, result_text)
-        result_text = _annotate_model_fallback(result_text, client)
+        result_text = _annotate_model_fallback(
+            result_text, client, stop_reason=_turn_stop["reason"]
+        )
         _missing = declared_mcp_not_ready_note(client)
         if _missing:
             result_text = f"⚠ {_missing}.\n\n{result_text}"
@@ -743,11 +766,15 @@ async def _cron_run_single(
                 session_key,
                 # Blank on a downgrade or an active fallback — see the
                 # sequential site above / provider_fallback_active. A
-                # half-applied pair pin bills the bare model that ran.
+                # half-applied pair pin bills the bare model that ran, and an
+                # engine fallback the model it moved to.
                 (
                     ""
                     if (_model_downgraded or provider_fallback_active(client))
-                    else ((job.model and provider_model_pin_partial(client)) or job.model or "")
+                    else engine_attributed_model(
+                        (job.model and provider_model_pin_partial(client)) or job.model or "",
+                        client,
+                    )
                 ),
                 _turn_usage,
                 provider=_provider,

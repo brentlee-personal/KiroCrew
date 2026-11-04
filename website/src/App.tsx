@@ -40,6 +40,13 @@ const GuideLayer = lazy(() => import('./guide/GuideLayer'))
 // App-contributed link previews (`contributes.linkPreviews`): hover detection only;
 // an app's module loads on the first hover of one of its links.
 const LinkPreviewLayer = lazy(() => import('./linkPreview/LinkPreviewLayer'))
+// App-contributed message actions (`contributes.messageActions`): a More-menu row per
+// approved action; an app's module loads only when its row is clicked.
+const MessageActionLayer = lazy(() => import('./messageActions/MessageActionLayer'))
+// App-contributed link opening (`contributes.linkOpen`): click detection only; an
+// app's module loads when the user chooses to open a link in it.
+const LinkOpenLayer = lazy(() => import('./linkOpen/LinkOpenLayer'))
+const SelectionActionLayer = lazy(() => import('./selectionActions/SelectionActionLayer'))
 // Lazy for the same reason: the crew work-item board is opened from a conductor
 // session or the Crew page, never at startup.
 const CrewBoardPage = lazy(() => import('./pages/CrewBoardPage'))
@@ -60,12 +67,13 @@ import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
-import { toggleBottomTerminal } from './hooks/useBottomTerminal'
+import { toggleBottomTerminal, useTerminalFullscreen } from './hooks/useBottomTerminal'
 import { RunInTerminalShellNotice, useRunInTerminalShellBridge } from './shell/runInTerminalShellBridge'
 import { TerminalHostContext } from './hooks/useTerminalCommand'
 // Side effect: closes a terminal tab when its shell exits (main window and popout).
 import './utils/terminalExitClose'
 import { focusPopout as focusTerminalPopout } from './utils/terminalPopout'
+import { mainStackingClass } from './utils/terminalFullscreen'
 import MigrationCheck from './components/MigrationCheck'
 import CrashReportNotice from './components/CrashReportNotice'
 import RemoteUpdateOffer from './components/RemoteUpdateOffer'
@@ -79,7 +87,6 @@ import QuickSearchSurface from './components/QuickSearchSurface'
 import ReportProblemModal from './components/ReportProblemModal'
 import KiroAccountModal from './components/KiroAccountModal'
 
-import { StartupVideo } from './shell/boot/startupVideo'
 import { i18nT } from './i18n/t'
 import { isAppNavId } from './appNotificationBadges'
 import { lazyPage, TasksRedirect, ChatRedirect, OrchestratedRedirect } from './shell/routes'
@@ -91,6 +98,7 @@ import { useAppShell } from './shell/appShell'
 import { ShellHeader } from './shell/topbar/shellHeader'
 import { ShellNavRail } from './shell/nav/navRail'
 import { NavItem, NavBadge } from './shell/nav/navRow'
+import { DockMatesTiles, useDockMates } from './shell/nav/matesDock'
 
 // Lazy on purpose: the update-found popup (its policy module, Trans runtime
 // wiring, and mutation plumbing) is dead weight for every session without an
@@ -102,6 +110,7 @@ const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
 // lapsed stored sign-in), so it is always mounted and its chunk is fetched once
 // at boot; it renders nothing in the common case.
 const KiroSignInNotice = lazy(() => import('./components/KiroSignInNotice'))
+const KasEngineNotice = lazy(() => import('./components/KasEngineNotice'))
 
 // Route-level code splitting for the App Store split (PR1): Discover and
 // Library are independent surfaces, and neither belongs in the app-core
@@ -316,11 +325,17 @@ export default function App() {
     setShortcutsOpen, toggleShortcutsModal, commandPalette, agentSwitchNotice, kiroUsageOpen, setKiroUsageOpen,
     kiroUsageState, kiroAccountEntry, metrics, subscribeLogs, subscribeSubagents, forceReconnect,
     updateFlow, updating, setUpdating, showUpdateModal, setShowUpdateModal, showChangelog, updateError,
-    setUpdateError, startupVideo, reportProblemOpen, setReportProblemOpen, effectiveCollapsed, activePath,
+    setUpdateError, reportProblemOpen, setReportProblemOpen, effectiveCollapsed, activePath,
     libraryNavActive, discoverNavActive, isChat, needsFixedHeight, navRowActive, membersRoute, mobileSingle,
   } = shell
   // "Run in terminal" from a code block outside every chat, on any route.
   const runInTerminal = useRunInTerminalShellBridge(activeSlotProject, !isPopout && !isEmbed)
+  // The dock terminal fills the content area only while maximized, so <main>
+  // becomes its own stacking context ONLY then — confining the fullscreen panel
+  // above the in-content chat layers it covers. Docked or closed, <main> creates
+  // no stacking context, so a page-level inline modal (fixed inset-0 z-[100])
+  // still paints over the dock as it does elsewhere.
+  const terminalFullscreen = useTerminalFullscreen()
 
   /**
    * Phone chat page: the main navigation as a 72px icon rail.
@@ -357,13 +372,15 @@ export default function App() {
    * renders no rail. The Crewmates page hosts it the same way, beside its
    * roster in the drawer over the open chat.
    */
+  // A docked mate's tile is the lit one while its chat is open (see navRail).
+  const { openIsDocked } = useDockMates()
   const railHost = mobileSingle || (isMobile && membersRoute)
   const mobileNavRail = railHost
     ? ({ onActivate }: MobileNavRailOptions) => {
       const railRow = (
         n: { path: string; id: string; label: string; labelKey?: string; icon: React.ReactNode; appName?: string },
       ) => {
-        const active = navRowActive(n.path)
+        const active = navRowActive(n.path) && !(n.id === 'members' && openIsDocked)
         return (
           <NavItem
             key={n.id}
@@ -442,7 +459,7 @@ export default function App() {
               onClickOverride={libraryNavActive ? onActivate : undefined}
             />
           </>}
-          apps={sortedAppGroup.map(railRow)}
+          apps={<>{sortedAppGroup.map(railRow)}<DockMatesTiles onActivate={onActivate} /></>}
           // Pinned above Settings while the rail has room; folded into the Apps
           // scroller (behind a divider) on screens where pinning them would leave
           // the app tiles less than four rows (shell/nav/adaptiveMobileRail.tsx).
@@ -544,6 +561,9 @@ export default function App() {
         </Routes>
       </>
     ) : isPopout ? (
+      <>
+      {/* A popped-out chat offers app items on selected text too. */}
+      <Suspense fallback={null}><SelectionActionLayer /></Suspense>
       <Routes>
         <Route path="/popout/chat/:slug?" element={<ErrorBoundary><PopoutFrame /></ErrorBoundary>} />
         <Route path="/popout/artifact/:slug" element={<ErrorBoundary><ArtifactPopoutFrame /></ErrorBoundary>} />
@@ -554,9 +574,11 @@ export default function App() {
             stray path to '/', which no longer matches anything here). */}
         <Route path="*" element={<Navigate to={initialPopoutPath} replace />} />
       </Routes>
+      </>
     ) : isEmbed ? (
       <div className="h-screen supports-[height:100dvh]:h-dvh w-screen overflow-hidden bg-bg flex flex-col">
         <KiroCrewNavBridge />
+        <Suspense fallback={null}><SelectionActionLayer /></Suspense>
         <EmbedTabStrip />
         <div className="flex-1 min-h-0">
           <Routes>
@@ -763,7 +785,6 @@ export default function App() {
               <UpdateFoundModal held={showChangelog || shortcutsOpen} />
             </Suspense>
           )}
-          <StartupVideo startupVideo={startupVideo} />
           <MobileConnectDialog mobileConnect={mobileConnect} />
           <RemoteUpdateOffer />
 
@@ -794,12 +815,12 @@ export default function App() {
           }
           : { gridArea: 'content' }}
       >
-        <div className={`flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
+        <div className={`relative flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
         {/* `outline-hidden`: main is a programmatic focus target (the skip
             link, and focus mode's hand-off when the chrome hides), not a
             control, so it opts out of the global :focus-visible ring the way
             the tabIndex={-1} page headings do. */}
-        <main id="main-content" tabIndex={-1} className={`outline-hidden flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
+        <main id="main-content" tabIndex={-1} className={`outline-hidden ${mainStackingClass({ isTerminalFullscreen: terminalFullscreen, terminalEnabled, terminalPoppedOut })} flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
           <MigrationCheck />
           {/* Route-independent, unlike MigrationCheck: "you crashed" is true of
               the app, not of the page, and the launch after a crash rarely lands
@@ -817,6 +838,17 @@ export default function App() {
               <KiroSignInNotice />
             </Suspense>
           </ErrorBoundary>
+          {/* Route-independent too: the first KAS chat on a host without a
+              working kiro-cli waits on the gateway downloading Kiro Crew's own
+              engine, whatever page is open. */}
+          <ErrorBoundary
+            scope="kas-engine-notice"
+            fallback={error => <KiroSignInNoticeFallback error={error} />}
+          >
+            <Suspense fallback={null}>
+              <KasEngineNotice />
+            </Suspense>
+          </ErrorBoundary>
           {/* The rail renderer reaches the chat page through context rather than
               a prop: the route element is shared with the popout/embed frames. */}
           <MobileNavRailContext.Provider value={mobileNavRail}>
@@ -827,6 +859,10 @@ export default function App() {
           <GuideProvider>
           <Suspense fallback={null}><GuideLayer /></Suspense>
           <Suspense fallback={null}><LinkPreviewLayer /></Suspense>
+          <Suspense fallback={null}><MessageActionLayer /></Suspense>
+          <Suspense fallback={null}><LinkOpenLayer /></Suspense>
+          {/* The shell's own nav read owns the shared app list here. */}
+          <Suspense fallback={null}><SelectionActionLayer readApps={false} /></Suspense>
           <Routes>
             <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />

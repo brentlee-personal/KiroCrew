@@ -18,8 +18,8 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat
-from kiro_crew.config.paths import data_home, peek_data_home
+from kiro_crew import env_node_windows, platform_compat
+from kiro_crew.config.paths import data_home
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # ``uv`` is a declared dependency shipped as a wheel (``setup.cfg``), so this
@@ -366,6 +366,7 @@ _NODE_MANAGER_DIRS = (
     # process and does not inherit N_PREFIX from the user's shell rc.
     "{home}/.n/bin",
 )
+# The same managers' Windows default roots live in :mod:`kiro_crew.env_node_windows`.
 # Standalone Node TREES -- an unpacked distribution rather than a manager's
 # per-version store, so there is no version to glob and no shim to consult.
 # These are where an operator unpacking a nodejs.org tarball by hand puts one.
@@ -559,8 +560,8 @@ def node_bin_dirs() -> tuple[str, ...]:
        because it names the version that script decided on.
     3. The highest version found under each per-version manager root
        (mise / asdf / nvm / fnm; nvm under both ``~/.nvm`` and the XDG config
-       dir).
-    4. Shim dirs (mise shims, volta, n).
+       dir; on Windows also fnm and nvm-windows under ``%APPDATA%``).
+    4. Shim dirs (mise shims, volta, n; on Windows also Volta's two roots).
     5. Standalone Node trees -- the glibc-2.17 build ``ensure-node.sh`` unpacks
        into the data home (:data:`_NODE_TREE_DATA_HOME_DIRS`), then a
        hand-unpacked nodejs.org tarball under ``~/.local``
@@ -598,11 +599,15 @@ def node_bin_dirs() -> tuple[str, ...]:
     if marker:
         ordered.append(marker)
 
+    globs = (*_NODE_MANAGER_GLOBS, *env_node_windows.manager_globs(home))
     ordered.extend(
-        _manager_version_bin_dirs(home, mise_data, _xdg_config_dir(home), all_versions=False)
+        _manager_version_bin_dirs(
+            home, mise_data, _xdg_config_dir(home), all_versions=False, patterns=globs
+        )
     )
 
     ordered.extend(d.format(home=home, mise_data=mise_data) for d in _NODE_MANAGER_DIRS)
+    ordered.extend(env_node_windows.manager_dirs(home))
     # Under a KIROCREW_HOME override data_home() mkdirs, so it can raise on an
     # unwritable path. Only the data-home candidates depend on it; swallowing here
     # keeps a failure from taking out the manager and $HOME tiers with them.
@@ -661,11 +666,13 @@ def _homebrew_keg_node_bin_dirs() -> list[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _node_all_bin_dirs(home: str, mise_data: str, xdg_config: str) -> tuple[str, ...]:
+def _node_all_bin_dirs(
+    home: str, mise_data: str, xdg_config: str, windows_globs: tuple[str, ...] = ()
+) -> tuple[str, ...]:
     """Cached body of :func:`node_all_bin_dirs`, keyed on its inputs.
 
     Keyed on every root the globs format (``home``, ``mise_data``,
-    ``xdg_config``) — matching the retired helper's ``home`` keying — so a
+    ``xdg_config``, the Windows globs from ``env_node_windows``) — matching the retired helper's ``home`` keying — so a
     caller under a different HOME or config dir (tests patching ``expanduser``
     or ``XDG_CONFIG_HOME``) gets a fresh scan instead of the previous key's
     dirs, while the steady-state gateway still globs exactly once.
@@ -673,7 +680,13 @@ def _node_all_bin_dirs(home: str, mise_data: str, xdg_config: str) -> tuple[str,
     out: list[str] = []
     seen: set[str] = set()
     for d in (
-        *_manager_version_bin_dirs(home, mise_data, xdg_config, all_versions=True),
+        *_manager_version_bin_dirs(
+            home,
+            mise_data,
+            xdg_config,
+            all_versions=True,
+            patterns=(*_NODE_MANAGER_GLOBS, *windows_globs),
+        ),
         *_homebrew_keg_node_bin_dirs(),
     ):
         d = os.path.normpath(d)
@@ -715,7 +728,8 @@ def node_all_bin_dirs() -> tuple[str, ...]:
     ever needs re-discovery without one.
     """
     home = os.path.expanduser("~")
-    return _node_all_bin_dirs(home, mise_data_dir(home), _xdg_config_dir(home))
+    windows_globs = env_node_windows.manager_globs(home)
+    return _node_all_bin_dirs(home, mise_data_dir(home), _xdg_config_dir(home), windows_globs)
 
 
 def node_augmented_path(base_path: str = "") -> str:
@@ -896,27 +910,6 @@ def git_build_info() -> tuple[str, str]:
     )
 
 
-def _managed_browser_cli_dirs() -> list[str]:
-    """Managed browser CLI directories exposed to agent shell commands.
-
-    The resolver in ``browser_cli.install`` never consumes this search path. It
-    resolves the same crew-home leaf by absolute path. These entries exist only
-    so an approved agent shell command can spell ``playwright-cli`` normally;
-    the OS sandbox seals the whole prefix read-only before that shell starts.
-    """
-    try:
-        root = peek_data_home() / "playwright-cli"
-    except Exception:
-        logger.debug("could not resolve managed browser CLI path", exc_info=True)
-        return []
-    entries: tuple[Path, ...]
-    if platform_compat.IS_WINDOWS:
-        entries = (root / "managed-bin", root / "bin", root)
-    else:
-        entries = (root / "managed-bin", root / "bin")
-    return [value for entry in entries if (value := _validated_bin_dir(str(entry)))]
-
-
 def _windows_toolbox_bin_dir(resolved_home: str, pinned_home: str | None) -> str | None:
     """Builder Toolbox's Windows bin dir, ``%LOCALAPPDATA%\\Toolbox\\bin``.
 
@@ -956,6 +949,14 @@ def user_tool_bin_dirs(home: str) -> list[str]:
     ]
 
 
+# Where a POSIX PATH's system section starts. An inherited well-known dir only
+# anchors :func:`augmented_path`'s prepend when it sits ahead of these. POSIX
+# only: augmented_path does no anchoring on Windows.
+_SYSTEM_BIN_DIRS = frozenset(
+    os.path.normcase(os.path.normpath(d)) for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+)
+
+
 def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     """Return *base_path* prepended with well-known MCP binary directories.
 
@@ -991,6 +992,31 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     ``acp.client``'s claude-backend resolvers), which must not consume a
     contributed directory. That contribution lives on :func:`mcp_search_path` —
     see the section comment near ``_registered_path_dirs``.
+
+    A well-known directory the inherited ``base_path`` ALREADY lists ahead of
+    its system dirs (``/usr/bin``, ``/bin``, ``/usr/sbin``, ``/sbin``) is an
+    ANCHOR: it is not prepended again, so it keeps the position the user gave
+    it. The prepend exists for a gateway whose inherited ``PATH`` lacks these
+    dirs (systemd / launchd / another non-login shell); re-prepending a dir the
+    user already placed behind their own (a Nix devshell's tool dirs) would
+    shadow the user's choice instead. Matching uses ``normcase(normpath(...))``
+    exactly as :func:`_dedup_dirs` does.
+
+    Every other extra keeps its rank relative to the anchors: extras ranked
+    before the first anchor are prepended as before, and each later extra is
+    inserted right after the right-most of the higher-ranked anchors. So un-inherited
+    per-version node bins still follow inherited mise shims or an inherited
+    ``/opt/homebrew/bin``, and still precede ``/usr/bin``. An inherited dir
+    that sits behind a system dir is not an anchor and is prepended as on
+    main, so a :func:`~kiro_crew.service.common.service_path` ``PATH``
+    (``~/.local/bin:/usr/local/bin:/usr/bin:/bin:<installer PATH>``, with
+    mise's shims after ``~/.local/bin`` on Linux) resolves in the same order
+    as before. With no anchor at all the output equals main.
+    Anchoring is POSIX-only: on Windows the system section (``System32``) comes
+    FIRST and user dirs such as ``~/.local/bin`` come last, so there is no
+    "ahead of the system dirs" to anchor in, and every extra is prepended
+    exactly as on main. The ``sys.executable`` fallback is still appended last regardless, since its
+    whole purpose is to resolve names found nowhere else.
     """
     resolved_home = home or os.path.expanduser("~")
     mise_data = mise_data_dir(resolved_home)
@@ -999,8 +1025,7 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     # would otherwise put a relative "{mise_data}/shims" entry on every spawned
     # subprocess's PATH, re-resolved against the CHILD's cwd — letting a
     # work-dir-relative executable shadow the configured command.
-    extra = _managed_browser_cli_dirs() if home is None else []
-    extra += [
+    extra = [
         e
         for d in _EXTRA_PATH_DIRS
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
@@ -1009,8 +1034,44 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
         toolbox_bin := _windows_toolbox_bin_dir(resolved_home, home)
     ):
         extra.append(toolbox_bin)
-    extra += _node_all_bin_dirs(resolved_home, mise_data, _xdg_config_dir(resolved_home))
-    parts = extra + ([base_path] if base_path else [])
+    extra += env_node_windows.manager_dirs(resolved_home, home)
+    windows_globs = env_node_windows.manager_globs(resolved_home, home)
+    extra += _node_all_bin_dirs(
+        resolved_home, mise_data, _xdg_config_dir(resolved_home), windows_globs
+    )
+    # Anchor each well-known dir the inherited PATH already lists ahead of its
+    # system dirs, so a prepend never moves it in front of the user's own dirs.
+    # Un-anchored extras keep their rank: before the first anchor they are
+    # prepended; after it they go right behind the right-most higher-ranked anchor.
+    # Windows has no anchors: its PATH lists System32 first and user dirs last,
+    # and _SYSTEM_BIN_DIRS never matches there, so anchoring would push every
+    # extra behind System32. Every extra is prepended there exactly as on main.
+    entries = base_path.split(os.pathsep) if base_path else []
+    anchors: dict[str, int] = {}
+    for i, p in enumerate(entries if not platform_compat.IS_WINDOWS else ()):
+        n = os.path.normcase(os.path.normpath(p)) if p else ""
+        if n in _SYSTEM_BIN_DIRS:
+            break
+        if n:
+            anchors.setdefault(n, i)
+    before: list[str] = []
+    after: dict[int, list[str]] = {}
+    anchor: int | None = None
+    for e in extra:
+        n = os.path.normcase(os.path.normpath(e))
+        if n in anchors:
+            # Never move back left: a lower-ranked extra must stay behind every
+            # higher-ranked anchor, even when the user listed those anchors in
+            # the opposite order (e.g. /usr/local/bin before the mise shims).
+            anchor = anchors[n] if anchor is None else max(anchor, anchors[n])
+        elif anchor is None:
+            before.append(e)
+        else:
+            after.setdefault(anchor, []).append(e)
+    parts = list(before)
+    for i, p in enumerate(entries):
+        parts.append(p)
+        parts.extend(after.get(i, ()))
     parts.extend(_interpreter_script_dirs())
     return os.pathsep.join(parts)
 

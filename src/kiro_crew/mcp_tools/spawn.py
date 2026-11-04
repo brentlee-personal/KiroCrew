@@ -432,6 +432,14 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
             effort_pendings.append((str(d.get("id", "?")), (t_effort, str(d["effort_pending"]))))
         if d.get("runtime_note"):
             runtime_notes.append((str(d.get("id", "?")), ("", str(d["runtime_note"]))))
+        if d.get("failover_from"):
+            # The run is not on the backend this call named: say where it went.
+            runtime_notes.append(
+                (
+                    str(d.get("id", "?")),
+                    ("", _failover_note(str(d["failover_from"]), str(d.get("backend") or "?"))),
+                )
+            )
 
     def _receipt() -> str:
         return _spawn_run_receipt(
@@ -458,6 +466,14 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
         submit_one=_submit_one,
         receipt=_receipt,
         reconcile_lost=_reconcile_lost,
+    )
+
+
+def _failover_note(requested: str, ran_on: str) -> str:
+    """The receipt line for a run ``agent.acp_failover`` moved off the backend asked for."""
+    return (
+        f"backend {requested!r} could not start; running on {ran_on!r} instead"
+        " (agent.acp_failover). The prompt goes to that backend's vendor and bill."
     )
 
 
@@ -608,12 +624,14 @@ def _spawn_run_receipt(
                 spawn_lines.append(
                     "\nAdvance only your ready, non-overlapping parent work for a short bounded "
                     "step (at most one minute), then END YOUR TURN so queued completion events "
-                    "can be delivered. If no such work remains, END YOUR TURN now. "
+                    "can be delivered. If no such work remains, reply with one line saying what you "
+                    "started, then END YOUR TURN. "
                     "Do not poll, duplicate child work, or claim the task is complete."
                 )
             else:
                 spawn_lines.append(
-                    "\nEND YOUR TURN now: this caller has no confirmed parent-work delivery "
+                    "\nReply with one line saying what you started, then END YOUR TURN: this "
+                    "caller has no confirmed parent-work delivery "
                     "boundary. Wait for the [Subagent completion event] messages. "
                     "Dispatch is not completion."
                 )
@@ -649,7 +667,7 @@ def spawn_continue(name: str, args: dict[str, Any]) -> str:
     return (
         f"Continued conversation {conv} as run {d.get('id', '?')}. "
         "The result will arrive as a [Subagent completion event] — "
-        "END YOUR TURN and wait for it."
+        "reply with one line saying what you continued, then END YOUR TURN and wait for it."
     )
 
 

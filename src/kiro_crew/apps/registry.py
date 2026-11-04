@@ -619,6 +619,7 @@ if _typing.TYPE_CHECKING:
     )
     from kiro_crew.apps.registry_pipeline.catalog import (  # noqa: F401
         FIRST_PARTY_AUTHORS,
+        NATIVE_WINDOWS_SHELL_REFUSAL,
         SOURCE_REGISTRY_PREFIX,
         _append_external_registry_apps,
         _apply_trust_fields,
@@ -633,6 +634,7 @@ if _typing.TYPE_CHECKING:
         _identity,
         _is_catalog_row,
         _is_external_row,
+        _manifest_shell_platform_refusal,
         _pinned_registry_entry,
         _platform,
         _registry_app_candidates,
@@ -731,6 +733,7 @@ if _typing.TYPE_CHECKING:
         NATIVE_WINDOWS_HOOK_REFUSAL,
         RESERVED_APP_NAME_CODE,
         StreamingLogLines,
+        _adoption_pending,
         _install_script_platform_refusal,
         _official_entry,
         _remote_controlled_url,

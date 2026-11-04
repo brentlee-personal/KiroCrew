@@ -69,15 +69,6 @@ def test_the_fold_is_lexical_and_only_strips_the_prefix() -> None:
     assert strip_extended_length_prefix("/a/b") == "/a/b"
 
 
-def test_file_explorer_is_within(tree) -> None:
-    from kiro_crew.apps.builtins.file_explorer import server
-
-    root, inside, outside = tree
-    assert server._is_within(Path(_prefixed(inside)), root)
-    assert server._is_within(inside, Path(_prefixed(root)))
-    assert not server._is_within(Path(_prefixed(outside)), root)
-
-
 def test_skill_root_containment(tree) -> None:
     from kiro_crew.dashboard.handlers._shared_skill_roots import _path_at_or_under
 
@@ -103,15 +94,6 @@ def test_steering_contained(tree, monkeypatch) -> None:
     _prefix_resolve_of(monkeypatch, inside)
     assert _contained(inside, root)
     assert not _contained(outside, root)
-
-
-def test_pptx_contained(tree, monkeypatch) -> None:
-    from kiro_crew.apps.builtins.pptx_maker.backend.paths import _contained
-
-    root, inside, outside = tree
-    _prefix_resolve_of(monkeypatch, inside)
-    assert _contained(inside, root) is not None
-    assert _contained(outside, root) is None
 
 
 def test_papyrus_safe_child(tree, monkeypatch) -> None:

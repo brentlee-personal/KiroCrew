@@ -48,6 +48,13 @@ export interface DecisionsConsentData {
    */
   nudge_evidence?: boolean
   /**
+   * The two `browser.step` scopes, page outlines and screenshots. Both are reported
+   * true when the keystone does not mention them -- on by default once consent
+   * stands -- and false only for an explicit no.
+   */
+  browser?: boolean
+  browser_images?: boolean
+  /**
    * One row per decision point this GATEWAY ships, projected from the seam's own
    * registry (`decisions/gate.py`). The card lists these rather than an array
    * written here, so a build that ships another point lights up a row with no
@@ -140,6 +147,21 @@ export interface DecisionsProviderData {
   local_permitted?: boolean
   /** The gateway-run local server. Absent on an older gateway. */
   runtime?: DecisionsRuntimeStatus
+  /**
+   * Plumb-4B's GPU switch. Absent on a gateway older than the switch.
+   * `available` is false when this host cannot install a CUDA torch; `enabled`
+   * is true only when the owner turned the switch on and a CUDA torch can be
+   * installed. `reason` is `""`, `no_driver`, `driver_too_old`, or
+   * `unsupported_platform`.
+   */
+  plumb_gpu?: DecisionsPlumbGpu
+}
+
+/** What the Decisions card shows for Plumb's GPU switch. */
+export interface DecisionsPlumbGpu {
+  available: boolean
+  enabled: boolean
+  reason: string
 }
 
 export function createDecisionsEndpoints({ get, post, put, del, j }: ClientTransport) {
@@ -187,6 +209,10 @@ export function createDecisionsEndpoints({ get, post, put, del, j }: ClientTrans
     // state. A local preset is then downloaded, installed and started by the gateway.
     saveDecisionsProvider: (preset: string) =>
       put('/api/decisions/provider', { preset }).then(j) as Promise<DecisionsProviderData>,
+    // Plumb's GPU switch. A boolean only: the gateway refuses it when this host
+    // cannot install a CUDA torch, and restarts Plumb when that preset is in use.
+    saveDecisionsPlumbGpu: (enabled: boolean) =>
+      put('/api/decisions/provider', { gpu: enabled }).then(j) as Promise<DecisionsProviderData>,
     // Delete a downloaded preset that is not in use, to give its disk space back.
     removeDecisionsLocalModel: (id: string) =>
       del(`/api/decisions/local-models/${encodeURIComponent(id)}`).then(j) as Promise<DecisionsProviderData>,

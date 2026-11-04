@@ -463,6 +463,7 @@ HARNESS_EXEMPT_SETS: dict[str, str] = {
     "ACP_BACKENDS_RESUME_WITHOUT_LOAD": "standard ACP: session/resume capability",
     "ACP_BACKENDS_LOAD_WITHOUT_MODES": "standard ACP: session/load result shape",
     "ACP_BACKENDS_SESSION_MCP_ARRAY": "standard ACP: session/new mcpServers array",
+    "ACP_BACKENDS_REMOTE_MCP_OAUTH": "off the wire: the agent file's remote-server oauth block",
     "ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION": "standard ACP: session/set_config_option",
     "ACP_BACKENDS_MODEL_AT_LAUNCH": "off the wire: the model is a launch argument",
     "ACP_BACKENDS_EFFORT_AT_LAUNCH": "off the wire: the effort is a launch argument",
@@ -486,6 +487,16 @@ HARNESS_EXEMPT_SETS: dict[str, str] = {
     "ACP_BACKENDS_LOCAL_HARNESS_COMMANDS": "Crew-side: dashboard answers harness commands",
     "ACP_BACKENDS_CONTEXT_RECYCLE": "Crew-side: session recycle on full context",
     "ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT": "Crew-side: worker prompt in the context block",
+    "ACP_BACKENDS_DIRECT_CLIENT_CHILD_CALLS_MARKED": (
+        "Crew-side: fail-closed list of backends whose sub-agent calls the direct "
+        "client's permission parser is proven to tell apart; a missing member only "
+        "loses the deny-rule override"
+    ),
+    "ACP_BACKENDS_SHARED_RUNTIME_CHILD_CALLS_MARKED": (
+        "Crew-side: fail-closed list of backends whose sub-agent calls the shared "
+        "runtime's permission parser is proven to tell apart; a missing member only "
+        "loses the deny-rule override"
+    ),
 }
 
 # ``initialize.agentInfo.name`` (or the ``_meta.agent_name`` header) a capture

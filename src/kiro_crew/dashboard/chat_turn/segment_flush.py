@@ -1102,6 +1102,12 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
         _flush_text_stream(turn)
         _flush_segment(state, slot, turn.assistant_text, broadcast=False)
         turn._reply_flushed = True
+        # A refusal terminal means the engine did not answer this turn: a turn
+        # its in-turn fallback recovered ends `end_turn` on both engines (KAS
+        # reports it so, and a V2 refusal hop drops the refusal it moved off;
+        # see acp/engine_fallback._drop_superseded_refusal). So no extra gate:
+        # a recovered turn never reaches Crew's refusal card or retry, and the
+        # engine-fallback notice is the only account of the walk.
         if _stop_reason == STOP_REASON_REFUSAL:
             # The Kiro service's content filter STREAMS its canned
             # explanation as assistant text and then ends the turn, so the
@@ -1167,6 +1173,10 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
                         "msg msg-info",
                         meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_REFUSAL_FALLBACK_SAME_MODEL),
                     )
+                turn.died_notice = (
+                    "The model declined to answer and the chat stopped. "
+                    "Open the chat to see why."
+                )
     elif _stop_reason == STOP_REASON_REFUSAL:
         # Model-side content refusal with no accompanying text: Anthropic's
         # bare `refusal` stop reason (passed through by every harness), or
@@ -1243,6 +1253,9 @@ async def _turn_settle_answer(turn: _ChatTurn) -> None:
                     "msg msg-info",
                     meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_REFUSAL_FALLBACK_SAME_MODEL),
                 )
+            turn.died_notice = (
+                "The model declined to answer and the chat stopped. " "Open the chat to see why."
+            )
     elif not turn._terminal_directive_applied and should_continue_after_compaction(
         # A turn that ended on an applied terminal directive is answered by
         # that directive, whatever compaction happened before it: the empty

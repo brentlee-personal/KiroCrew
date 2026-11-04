@@ -195,6 +195,13 @@ _SETTING_ORDER: dict[str, tuple[Any, ...]] = {
     "dashboard.shared_crew.tailnet_direct": (False, True),
     "skills.approval_required": (True, False),
     "telemetry.beacon_enabled": (False, True),
+    # Kiro's own Chromium holds none of the person's logins; ``auto`` and
+    # ``user_chrome`` hand the agent the person's Chrome, signed in.
+    "browser.choice": ("headless", "kiro_chromium", "auto", "user_chrome"),
+    # Off, password boxes show in the live picture.
+    "browser.live.mask_passwords": (True, False),
+    # On, Kiro's Chromium starts signed in to the edition's sites.
+    "browser.credentials.enabled": (False, True),
 }
 
 #: Card-editable config paths (``_EDITABLE_CONFIG``) that no value can widen
@@ -220,8 +227,19 @@ _CANNOT_WIDEN_SETTINGS: frozenset[str] = frozenset(
         "agent.soft_stop_budget_secs",
         "agent.tool_search",
         "auto_update",
+        # A list, so no card reaches it (see ``skills.extra_paths``). Adding a
+        # domain can widen where the edition's sign-in is used, so if cards ever
+        # carry list values this moves to a widening class.
+        "browser.credentials.domains",
+        # The live view's shape: on/off, picture quality, frame-rate ceiling.
+        "browser.live.enabled",
+        "browser.live.max_fps",
+        "browser.live.quality",
         "computer_use.max_tree_nodes",
         "computer_use.screenshot_max_px",
+        # A list, so no card reaches it (see ``skills.extra_paths``). Loopback
+        # ``host:port`` entries only, for the Preview tab, which no agent drives.
+        "dashboard.browser_local_origins",
         "dashboard.crewmate_threads",
         "dashboard.dynamic_dashboard_cards",
         # A feature preview only decides whether the dashboard OFFERS an
@@ -634,6 +652,7 @@ KINDS: dict[str, KindDef] = {
                     "server": _STR,
                     "entry": {"type": "object"},
                     "origin": {"type": "object"},
+                    "mount_only": _BOOL,
                 },
                 ["template", "server", "entry", "origin"],
             ),
@@ -1520,12 +1539,17 @@ def validate_params(kind: str, params: Any) -> dict[str, Any]:
     if kind == KIND_TEMPLATE_MCP_SERVER:
         from kiro_crew import template_mcp_additions as _additions
 
-        _only(p, {"template", "server", "entry", "origin"})
+        _only(p, {"template", "server", "entry", "origin", "mount_only"})
         out_srv: dict[str, Any] = {
             "template": _clean_str(p, "template", pattern=_TEMPLATE_NAME_RE),
             # One path segment of plain characters: the Undo names it in its path.
             "server": _clean_str(p, "server", pattern=_TEMPLATE_NAME_RE),
         }
+        if "mount_only" in p:
+            if not isinstance(p["mount_only"], bool):
+                raise _fail("invalid_param", "'mount_only' must be a boolean")
+            if p["mount_only"]:
+                out_srv["mount_only"] = True
         entry = p.get("entry")
         if not isinstance(entry, dict):
             raise _fail("invalid_param", "'entry' must be an object")

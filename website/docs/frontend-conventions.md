@@ -584,6 +584,12 @@ Add a new protocol to `ALLOWED_PROTOCOLS` in that file, and only there. Each
 addition widens what a model-authored or user-pasted link can launch on the host,
 so treat it as a security change, not a formatting one.
 
+In a desktop-app pane (`isDesktopAppPane`), `MdAnchor` opens an editor link
+with `window.open` on a plain click, because the frame's CSP `frame-src`
+refuses an in-place navigation to a custom scheme. Other pages keep in-place
+navigation. In the desktop app that call reaches the window-open handler in
+`website/electron/external-scheme.js`, which asks the user before opening it.
+
 How a refused destination RENDERS is part of the contract (issue #9925): the
 transform's rejection sentinel is `''`, and `MdAnchor`'s `!href` guard renders
 the label as inert text with **no anchor** — never `<a href="">`, whose empty
@@ -1062,7 +1068,12 @@ To add one:
 2. Export it as the module default.
 3. Add one entry to `BUILTIN_COMPONENT_REGISTRY` (a `BuiltinAppEntry`):
    `'/my-app': { component: lazy(() => import('./my-app/MyAppPage')), appId: '<app.json name>' }`.
-   `appId` must equal the `name` in the app's `app.json` manifest.
+   `appId` must equal the `name` in the app's `app.json` manifest. A page that
+   opens an absolute path handed to it in its URL also sets `opensPathParam` to
+   the query parameter it reads (`<route>?<param>=<path>`). The file viewer's ⋯
+   menu then offers "Open in <app>" for it through `src/apps/pathOpener.ts`,
+   which names no app: it takes the first such entry whose app is enabled and
+   routed natively.
 4. Declare `ui.pages` in the app's `app.json` manifest, and its `ui.icon` name.
 5. If the icon is not already in `src/apps/builtinIcons.tsx`, add it to
    `BUILTIN_ICON_REGISTRY` (Lucide element, `size={16}`).

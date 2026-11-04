@@ -64,13 +64,18 @@ the field absent, which is the all-``ask`` case above.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.acp import kas_env_launch
+from kiro_crew.acp import kas_env_launch, session_label
+from kiro_crew.acp.kas_app_identity import TOKENED_ENV_KEYS_KEPT as _TOKENED_ENV_KEYS_KEPT
+from kiro_crew.acp.kas_app_identity import (
+    gateway_bound_port,
+    tokened_app_element,
+    without_noop_restrictions,
+)
 from kiro_crew.acp.kas_auto_approve import auto_approve_refs
 from kiro_crew.acp.kas_permissions import (
     AUTO_APPROVABLE_CAPABILITIES,
@@ -100,13 +105,9 @@ from kiro_crew.agent_discovery import (
     spec_welcome_message,
 )
 from kiro_crew.agent_files import LITE_AGENT_FILENAME, kas_wire_agent_id
-from kiro_crew.agent_sdk.spec_hooks import spec_script_hooks
+from kiro_crew.agent_sdk.spec_hooks import spec_script_hooks, user_hook_files
 from kiro_crew.agent_spec_format import agent_spec_candidates, is_markdown_spec
-from kiro_crew.hooks import (
-    HOOK_EVENT_PRE_TOOL_USE,
-    get_global_hook_store,
-    persisted_hook_store,
-)
+from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE, get_global_hook_store, persisted_hook_store
 from kiro_crew.mcp_cleanup import (
     KIROCREW_BIN_MCP_SERVERS,
     MCP_REGISTRY_TYPE,
@@ -656,7 +657,7 @@ def _project_mcp_servers(
       reason managed env is projected at all: without it the shims read a
       different data home than the gateway. A managed entry still lives in a
       user-editable agent file, so a hand-added literal under a managed name is
-      withheld like any other.
+      withheld like any other. An opted-in entry gains only the session label.
 
     * **a muted server** — an entry carrying ``disabled: true`` is not declared at
       all. KAS's wire schema accepts the field and its mapper then drops it
@@ -791,6 +792,7 @@ def _project_mcp_servers(
             continue
         projected = {k: v for k, v in entry.items() if k not in _WRAPPER_MARKERS}
         projected.pop("autoApprove", None)
+        labelled, relay_env = session_label.take_kas_marker(projected, entry.get("env"), managed)
         discarded = [k for k in _KAS_DISCARDED_ENTRY_KEYS if projected.get(k)]
         if discarded:
             # Read off the PROJECTED entry, not the spec's: a key this function
@@ -812,13 +814,8 @@ def _project_mcp_servers(
             # Native MCP children do not inherit the gateway's environment.
             # Take the live listener from the gateway, never from an editable
             # spec or process discovery.
-            bound_port = os.environ.get("KIROCREW_BOUND_PORT", "")
-            if (
-                1 <= len(bound_port) <= 5
-                and bound_port.isascii()
-                and bound_port.isdecimal()
-                and 0 < int(bound_port) < 65536
-            ):
+            bound_port = gateway_bound_port()
+            if bound_port:
                 projected.setdefault("env", {})["KIROCREW_PORT"] = bound_port
             if session_key:
                 projected.setdefault("env", {})["KIROCREW_SESSION_KEY"] = session_key
@@ -826,10 +823,19 @@ def _project_mcp_servers(
             # The withheld env values stay on this machine: the engine is handed
             # Crew's launcher and a reference, never the values (kas_env_launch).
             projected, _launched, complete = kas_env_launch.relay_withheld_env(
-                projected, entry.get("env"), session_key=session_key, agent_id=agent_id, server=name
+                projected, relay_env, session_key=session_key, agent_id=agent_id, server=name
             )
             if complete:
                 withheld = [w for w in withheld if not w.startswith("env")]
+            projected, bridged = kas_env_launch.relay_withheld_headers(
+                projected,
+                entry.get("headers"),
+                session_key=session_key,
+                agent_id=agent_id,
+                server=name,
+            )
+            if bridged:
+                withheld = [w for w in withheld if w != "headers"]
         if withheld:
             logger.info(
                 "agent %r: not relaying %s for MCP server %r — the field can carry "
@@ -839,7 +845,7 @@ def _project_mcp_servers(
                 "/".join(withheld),
                 name,
             )
-        out[name] = projected
+        out[name] = session_label.with_kas_label(projected, session_key if labelled else None)
     return out
 
 
@@ -1428,12 +1434,17 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
 def pre_tool_hook_matchers(agent_id: str, spec: dict[str, Any]) -> tuple[str, ...]:
     """The matchers of every PreToolUse hook a KAS session's calls meet.
 
-    Two sources, both fired by Crew's permission path: the spec's own ``hooks``
-    (Crew fires them on KAS, see :mod:`kiro_crew.agent_sdk.spec_hooks`) and the
-    Hooks page's store. The projection withholds auto-approval for what they cover,
-    because an auto-approved call never reaches that path. Read at session start:
-    a Hooks-page hook added later gates auto-approved calls from the next session
-    on.
+    Three sources, all fired by Crew's permission path on KAS: the spec's own
+    ``hooks`` (Crew fires them on KAS, see :mod:`kiro_crew.agent_sdk.spec_hooks`),
+    the Hooks page's store, and the user's standalone ``~/.kiro/hooks/*.json``
+    files (:func:`kiro_crew.agent_sdk.spec_hooks.user_hook_files`). The projection
+    withholds auto-approval for what they cover, because an auto-approved call
+    never reaches that path -- a user-file PreToolUse hook that exits 2 would
+    otherwise be skipped on exactly the calls KAS auto-approves. Read at session
+    start: a Hooks-page or user-file hook added or edited later gates
+    auto-approved calls from the next projection on
+    (:func:`kiro_crew.agent_sdk.spec_hooks.hook_projection_stale` reads this same
+    list, so an edit that changes a file's content marks the session stale).
 
     Fails toward gating. A source that cannot be read answers ``("*",)``, which
     withholds every auto-approval, rather than an empty tuple that would let a call
@@ -1444,7 +1455,7 @@ def pre_tool_hook_matchers(agent_id: str, spec: dict[str, Any]) -> tuple[str, ..
         # saved hooks on disk, and they still gate its calls; a saved file that
         # cannot be read raises, which withholds every auto-approval below.
         store = get_global_hook_store() or persisted_hook_store()
-        hooks = [*spec_script_hooks(agent_id, spec), *store.list_all()]
+        hooks = [*spec_script_hooks(agent_id, spec), *store.list_all(), *user_hook_files()]
     except Exception:  # noqa: BLE001 - fail toward gating, see the docstring
         logger.warning(
             "PreToolUse hooks for %r could not be listed; no call is auto-approved",
@@ -1725,8 +1736,14 @@ def hoist_servers_for_session(
     include_user_servers: bool = False,
     reserved_names: frozenset[str] = frozenset(),
     managed_entries: Mapping[str, Any] | None = None,
+    app_launches: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Carry the ACTIVE agent's servers for this session in the session-level array.
+
+    *app_launches* (from :func:`kas_app_identity.resolve_app_identity_launches`)
+    names the builtin app servers that run Crew's own code. Each is hoisted like a
+    managed server and, with a token, relaunched from its shipped manifest launch
+    and stamped (:func:`kas_app_identity.tokened_app_element`).
 
     Managed declarations always move; user-declared ones move only with
     ``include_user_servers=True`` (the ``session/load`` path).
@@ -1830,11 +1847,12 @@ def hoist_servers_for_session(
         return custom_agents, session_servers
     from kiro_crew.acp.session_mcp import acp_server_element
 
+    apps = app_launches or {}
     taken = {
         str(entry.get("name"))
         for entry in session_servers
         if isinstance(entry, dict) and entry.get("name")
-    } | (reserved_names - MANAGED_MCP_SERVER_NAMES)
+    } | (reserved_names - MANAGED_MCP_SERVER_NAMES - frozenset(apps))
     hoisted: list[dict[str, Any]] = []
     out_agents: list[dict[str, Any]] = []
     for descriptor in custom_agents:
@@ -1845,7 +1863,11 @@ def hoist_servers_for_session(
         remaining: dict[str, Any] = {}
         for name, entry in declared.items():
             keep = True
-            managed = name in MANAGED_MCP_SERVER_NAMES
+            managed = name in MANAGED_MCP_SERVER_NAMES or name in apps
+            if name in apps:
+                # The shipped manifest declares ``disabled: false``; the resolver
+                # already refused a restricted entry, so only no-op keys drop here.
+                entry = without_noop_restrictions(entry)
             if (
                 (managed or include_user_servers)
                 and name not in taken
@@ -1875,30 +1897,25 @@ def hoist_servers_for_session(
     if session_token:
         # Deferred like session_mcp above: the kiro path returns before this, and
         # the token is per SESSION while the projection is per agent.
-        # Apply the token only to managed entries; user-declared servers hoisted
-        # via ``include_user_servers=True`` travel as projected with no session
-        # credential.
+        # Apply the token only to managed and app entries; user-declared servers
+        # hoisted via ``include_user_servers=True`` travel as projected with no
+        # session credential.
         from kiro_crew.mcp_gateway.session_servers import attach_stub_session_token
 
-        hoisted = [
-            (
-                _tokened_managed_element(
+        tokened: list[dict[str, Any]] = []
+        for element in hoisted:
+            name = element["name"]
+            if name in MANAGED_MCP_SERVER_NAMES:
+                element = _tokened_managed_element(
                     element, session_token, attach_stub_session_token, managed_entries
                 )
-                if element["name"] in MANAGED_MCP_SERVER_NAMES
-                else element
-            )
-            for element in hoisted
-        ]
+            elif name in apps:
+                element = tokened_app_element(
+                    element, apps[name], session_token, attach_stub_session_token
+                )
+            tokened.append(element)
+        hoisted = tokened
     return out_agents, _pin_legacy_negotiation(_managed_first([*session_servers, *hoisted]))
-
-
-#: Env keys a tokened hoisted element keeps from its projection. Both are set by
-#: :func:`to_client_custom_agent` from the gateway's own values (the bound port,
-#: the session key) and never from the spec, which ``_MANAGED_ENV_KEYS_KEPT``
-#: limits to ``KIROCREW_HOME`` -- a home-deriving key a tokened launch must not
-#: take from a hand edit.
-_TOKENED_ENV_KEYS_KEPT = ("KIROCREW_PORT", "KIROCREW_SESSION_KEY")
 
 
 def resolve_managed_entries(

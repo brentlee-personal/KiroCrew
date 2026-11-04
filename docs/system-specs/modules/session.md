@@ -226,7 +226,9 @@ ask is never brought back);
 `changes_since_away` (item reports, decisions and closes after the away
 anchor, and session-ledger events after it, each with its source (worker
 report, conductor decision, work ledger or session ledger) and `HH:MM`
-time); `transcript_since_owner` (the
+time; a PR's live state is not listed here, since the read cannot tell when
+it merged, and stays in `live_prs`);
+`live_prs`; `transcript_since_owner` (the
 owner's last genuine message and every turn since, whole; over budget the
 oldest drop first); `open_items` (open items, and terminal ones that changed
 while the owner was away, questions and blocked first); `goal` (conductor
@@ -234,9 +236,20 @@ goal, else session-ledger goal, else the owner's newest message);
 `goal_progress`; and `owner_recent_messages` (the owner's last three genuine
 messages, which pick the reply language and the script of the fixed lines).
 
-The prompt allows merged, green, approved or conflict states only from a
-change newer than the away time; anything else is written as "not checked
-since HH:MM" with the time of the newest report or message that states it.
+The live read covers only pull requests the open asks name, at most five,
+through the structured monitor's GitHub probe (`GitHubPullRequestProvider`).
+A PR's repository comes only from ledger data or a full PR URL: each open
+question or blocked item's own PR (its `pr`, or its acceptance's `pr`, in its
+acceptance's `repo`), then every `https://github.com/<owner>/<repo>/pull/<n>`
+URL in the pending ask's text and choices and in those items' text. A bare
+`#N` or a written `owner/repo#N` is never resolved to a repository, so it is
+not read. PR links in the card and buttons for the pending choices come in
+follow-up changes. Each answer
+is cached in process for 15 minutes. Every entry carries `read_at`, or
+`checked: false` with `not_checked_since` (the last good read, or `never`).
+The prompt allows merged, green, approved or conflict states only from
+`live_prs` or a change newer than the away time; anything else is written as
+"not checked since HH:MM".
 
 The prompt asks for parts in order: the goal, what changed since the owner
 left (each fact with source and time), numbered asks (what, why only the
@@ -245,9 +258,34 @@ that do not need the owner, and what runs next. It returns one JSON object:
 `status` (`on_track`, `needs_you`, `blocked` or `done`; anything else reads as
 `needs_you` when `needs_you` has items, else `on_track`, and `on_track` or
 `done` beside `needs_you` items reads as `needs_you`), `headline` (at most
-240 characters), `needs_you` (at most four items of 200) and a plain-text
-`body` (lines kept, 2,400 characters, 32 lines), words only: the model draws no
-HTML, and a `widget` it returns anyway is ignored. Older fields (`asked`,
+240 characters), `needs_you` (at most four items of 200) and a markdown
+`body` (kept as source, defanged, trailing whitespace dropped, 6,000
+characters, 160 lines; the model's output budget is 40 KiB). Markdown images
+and `<img>` tags outside a widget or code fence draw as their alt text only
+(a widget frame allows no remote image). The secret and grounding
+scans run last, after every transform, on the exact strings the row would
+post: the secret scan on its whole `content` and each `meta.brief` field,
+the PR, SHA and time scans on the model-written strings only (each
+`meta.brief` field and the body as `content` carries it; the gateway's own
+waiting cards are not model text). Any grounding miss drops every model
+field, never masks or edits one. Every scanner reads the same three views
+of its text, built by one function: the canonical form (HTML entities
+decoded until stable, then NFKC) as written, with tags, comments and link
+syntax removed until none is left so the halves around them join, and that joined form with
+emphasis and code marks also removed; colour declaration values are removed
+in every view. A miss is a secret in any view, or a pull request outside
+the verified set (a live read, the snapshot or the owner's request, read by
+`inputs.pr_numbers`).
+Before posting, the gateway runs the RFC's section 3.9.6 output check over
+every model field, the whole body included: every commit SHA must appear in
+the snapshot, and every HH:MM must appear in the snapshot or be the prompt's
+"as of" time. On a
+miss every model field is dropped and the card posts with the gateway's
+waiting cards and the fixed failure line as its headline. The body may carry one
+picture the model chooses when it helps the owner act: a mermaid block, a
+markdown table or an `<mcwidget>`, with no fixed template; the prompt forbids a
+bare "N of M done" line, links and images. A separate `widget` field the model
+returns is ignored. Older fields (`asked`,
 `remaining`, `done`, `next`, `extra`) still parse; `headline` is required and
 an older `now` or `{"message"}` reply is read as it. The gateway lists
 `waiting` itself: every open work item whose status is `blocked` or `question`
@@ -255,34 +293,51 @@ with reason `approval` or `needs_human`, as `{title, ask}` (title and summary,
 cleaned like a model field), in ledger order, at most 50, with `waiting_total`
 counting them all; the prompt tells the model not to repeat them in
 `needs_you`, and a `done` or `on_track` status beside anything waiting reads as
-`needs_you`. `progress` is never the model's: the gateway stores
-`{accepted, total}` only over the current goal's work items after a `new_goal`
-write (the newest `goal_items_used`), and leaves it out when the board never
-recorded a goal or the goal's items cannot be told apart. Each text field is
+`needs_you`. The brief stores no progress count; `goal_progress` in the
+prompt is the gateway's own `{accepted, total}` over the current goal's work
+items after a `new_goal` write (the newest `goal_items_used`), null when the
+board never recorded a goal or the goal's items cannot be told apart, and the
+model reads it only as a fact. Each text field is
 redacted before and after whitespace is collapsed and `**` dropped, then
 control markers (`[OPTIONS:`, `[STEERING`, `<!--`, any bracket form) are
 defanged, then the field is capped.
 
+The gateway post-checks the result: any pull-request number (a PR URL,
+`owner/repo#N`, or a bare `#N` or `PR#N`, matched with ASCII boundaries, so a
+CJK letter next to the number is a boundary; a number followed by a letter, as
+in the colour `#007bff`, or cut by a field cap's closing `…` names no PR) in a
+model-written field that neither the prompt's input nor the original
+request named fails the result, and the
+fixed failure line posts instead.
 The result is one mate message: `meta.brief` holds the fields and `content`
-holds the same brief as labelled plain text. The transcript draws `meta.brief`
-as a fixed card (`WarmBriefCard`) that renders every field as a plain text
-node, in the order status and headline, the progress orb (`WarmBriefOrb`),
-body, What you asked, Done, Next, then the `extra` sections. The orb is a
-fixed component: its liquid height and glow are `accepted / total`, sparkles
-show when the count is full, and a brief with no count (no current goal, or a
-goal with no items) draws no orb and no caption, only the cards and the status
-tag. Above it float the `waiting` items, then the model's
-`needs_you`, as wrapping cards; the first three show and the rest fold behind
-one "N more" toggle that also counts items past the gateway's list. Every orb
-animation sits inside `prefers-reduced-motion: no-preference`, colours are
-theme variables with a tighter halo on light themes, and the orb reads as a
-`progressbar` labelled with the count. A brief stored before the orb keeps its
-`widget` HTML, drawn last in the sandboxed `WidgetFrame`; an older `now` brief
-with no status and no count keeps its plain Needs you list. A row without a
+holds the same brief as labelled plain text; there the body's widget becomes a `[widget]` mention, links keep only their text and bare addresses become code, because a reply thread's parent and history draw `content` under the chat profile. The transcript draws `meta.brief`
+as a card (`WarmBriefCard`) in the order status and headline, the waiting
+cards (`WarmBriefWaiting`), body, What you asked, Done, Next, then the `extra`
+sections. Every field but `body` is a plain text node. The waiting cards are
+fixed code fed by gateway data: the `waiting` items, then the model's
+`needs_you`, as wrapping text cards with theme colours and no motion; the
+first three show and the rest fold behind one "N more" toggle that also counts
+items past the gateway's list. The card draws no progress picture or count,
+and a `progress` an older stored brief carries is ignored. The body is drawn
+by the same `MarkdownRenderer` an ordinary assistant reply uses, so a mermaid
+block renders as a diagram, a table as a table, and an `<mcwidget>` as a live
+widget: the same `WidgetFrame`, sandbox, message time and session key as one in
+an ordinary assistant reply, under the `welcome` frame profile
+(`components/widgetFrameProfile.ts`). It keeps page scripts and clicks, but
+its CSP names no CDN script origin (connect, image and font sources are local
+only, as for every widget), it has no link bridge and no bare-link rewrite,
+and the host ignores its `mc-widget-action`, so it never pre-fills the
+composer. It has no star, because an artifact page would draw it under the
+chat profile. Links in the body draw as plain text. Below the body the card draws the gateway's link row (RFC section 3.9.3): one `owner/repo#N` link per pull request the brief read live, its URL built from that read's own repo and stored in `meta.brief.links`; `content` carries the row as its labels, the section 3.9.6 secret check reads the text with the row, and the model's text is never rewritten. The chat profile is
+unchanged. A page script can still navigate its own frame, which the sandbox
+and CSP cannot forbid. A cap that would cut inside a widget or code fence
+drops that block whole, and the prompt names both caps. A brief stored with a separate `widget` field keeps
+that HTML, drawn last in the same frame; an older `now` brief with no status
+keeps its plain Needs you list. A row without a
 valid `meta.brief` keeps the ordinary bubble. The card is the body of the
 ordinary assistant bubble, so the row keeps its timestamp and row actions, and
 Copy takes the plain-text `content`; chat search reads the card's own visible
-text. Only an assistant row draws it: any other role carrying the same
+text, with the body's `<mcwidget>` HTML left out as for any assistant reply. Only an assistant row draws it: any other role carrying the same
 `meta.kind` draws as its own role. These generated rows are excluded from the
 task fingerprint. A new user turn, slot replacement, reset, close, and a
 finished task drop a stale result unposted. The owner leaving drops the brief
@@ -2918,6 +2973,13 @@ envelope on a cold session.
 - `close_all()`: saves all active mappings before killing processes.
 - `start_pool()`: prunes stale entries (files deleted by kiro-cli GC).
 
+**A file the load cannot use is never written over unread.** One leading UTF-8
+byte-order mark reads normally. A file that is not a JSON object starts the map
+empty, and the first write moves it to `session_map.json.corrupt-<utc>` before
+landing; a failed move fails that write and the state stays owed. A file whose
+read raises `OSError` is left alone, and every write raises until a restart reads
+it (`session_map_store._load`, `_write_payload`).
+
 **Module layout:** `kiro_crew.session_map` is the import path and defines `SessionMap`
 itself: the constructor, the resume rule and both stale paths (`get`, `prune`, the per-read
 repair), the session pointer and the per-conversation state, the privacy rows, and the
@@ -3526,8 +3588,8 @@ judge and the skill merge) quote transcript rows the same way and go out the
 same way, through `stream_and_collect(..., allow_image=False)`.
 `chat_title._title_text` does not call the scrubber at all: it strips markdown
 images and attachment markers its own way and keeps an escaped or code-quoted
-`![x](…)` readable, while the scrubber's bare-path pass replaces the
-destination inside an escaped one (a code-quoted one survives both passes). A
+`![x](…)` readable; the scrubber keeps both as written too, because it reads
+escaped and code-quoted markup as literal text, as the prompt builder does. A
 channel's bare path is neither, so it stays in the title prompt as text. A row's picture belonged
 to an earlier turn and a text vehicle cannot carry bytes, so the reference is
 the only thing that would arrive, and both readings of it are wrong: while the
@@ -5354,7 +5416,7 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
-The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, and `deliver_ws_owners` for `suggest_followup` — so behavior is unchanged. (`ask_question` is not applied here; it blocks and returns the answers as its tool result — full contract in `learn-cron-dashboard.md` → "Agent Questions".) `reset_conversation` is the one directive whose core is not reachable inline: it queues `SessionManager.discard_conversation` on the slot for `chat_turn.session_reset._consume_pending_reset` to apply at a turn boundary, because the discard is a full provider teardown and the producer is mid-turn — the same deferral `set_project` uses, and the reason the immediate route (`POST /api/chat/slots/{slot}/reset-conversation`) answers 409 on a busy slot rather than tearing down a turn mid-write. It queues the session key THIS TURN ran on, passed in by the consumer, never re-resolved from the slot: `linked_session_key` is mutable, so a cron or workflow injection that rebinds the slot between the request and the consume would otherwise discard whatever the slot points at by then and leave the caller's conversation alone. On the turn path, only the END-OF-TURN consume may apply a discard (`allow_discard`); the two earlier consume points run just before a turn acquires the session, where a teardown lands under a channel turn already streaming on it. The one other caller is `/clear` on a backend with no command channel (`_answer_slash_without_channel`), which runs before any session work and is safe for the reason below: `skip_if_busy`. Even at that boundary it does not assume: the discard goes through `discard_conversation(..., skip_if_busy=True)`, which refuses under the same session lock that pops the session, mirroring `reset`'s own guard. Probing from the consumer and tearing down afterwards would leave a window in which a channel message acquires the session's semaphore and begins streaming a reply the teardown then destroys — and the semaphore is the stricter signal anyway, since `provider.has_active_turn()` cannot see a turn holding the semaphore with no prompt in flight yet. A refusal returns False and changes nothing, replay flag and session map included, so the consumer leaves the flag armed for a later boundary. The sid clear runs in the SAME tick as the pop, with no await between them — deferring it past the shutdown awaits lets a concurrent channel turn map a SUCCESSOR session under the key while the old provider is still shutting down, and the clear then erases the successor's pointer instead of the discarded one. Sub-agent children are the other wait — `discard_conversation` releases the shared runtime they run on, so a running or queued child, or an in-flight completion-event delivery, also leaves the flag ARMED rather than killing the child's work. Both that consume and the route's 409 read one predicate, `chat_utils.subagents_attached_async`, so the two cannot drift. The queued flag is in-memory slot state: a gateway restart while it sits armed drops the reset the confirmation promised, which is accepted rather than persisted — the cost is one un-applied reset the caller can ask for again, against durable state for a transient intent. `set_project`, `reset_conversation` and `suggest_followup` additionally require structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing — nor, for the last of the three, post a follow-up card into a human's session on the strength of a dashboard tab they merely inherited. `suggest_followup` is the case where the surface gate and the origin gate come apart: `_DASHBOARD_ONLY_DIRECTIVES` asks only whether an open tab EXISTS, which a cron or sub-agent turn riding a user's slot satisfies without a human having asked for a card, so membership in `_USER_ORIGIN_DIRECTIVES` is what makes the tool's own documented refusal true. Unlike `reset_conversation`, `suggest_followup` has no self-wake carve-out: only a turn a person sent can post a card, so the session's own sub-agent synthesis turns and monitor wakes are refused too. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
+The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, and `deliver_ws_owners` for `suggest_followup` — so behavior is unchanged. (`ask_question` is not applied here; it blocks and returns the answers as its tool result — full contract in `learn-cron-dashboard.md` → "Agent Questions".) `reset_conversation` is the one directive whose core is not reachable inline: it queues `SessionManager.discard_conversation` on the slot for `chat_turn.session_reset._consume_pending_reset` to apply at a turn boundary, because the discard is a full provider teardown and the producer is mid-turn — the same deferral `set_project` uses, and the reason the immediate route (`POST /api/chat/slots/{slot}/reset-conversation`) answers 409 on a busy slot rather than tearing down a turn mid-write. It queues the session key THIS TURN ran on, passed in by the consumer, never re-resolved from the slot: `linked_session_key` is mutable, so a cron or workflow injection that rebinds the slot between the request and the consume would otherwise discard whatever the slot points at by then and leave the caller's conversation alone. On the turn path, only the END-OF-TURN consume may apply a discard (`allow_discard`); the two earlier consume points run just before a turn acquires the session, where a teardown lands under a channel turn already streaming on it. Two other callers set it. `/clear` on a backend with no command channel (`_answer_slash_without_channel`) runs before any session work. The pending-reset retry (`chat_turn.session_reset._arm_pending_reset_retry`) runs off any turn on a timer, channel-linked slots included, and every branch that leaves a discard armed (sub-agents attached, a question pending, a turn in flight, the discard raising) arms it, so an armed discard always has a consume coming. Neither is at a turn end, and neither needs one: both are safe for the two atomic refusals below, `skip_if_busy` under the session lock and the attached-children wait, which a turn end supplies for free and these callers check rather than assume. Even at that boundary it does not assume: the discard goes through `discard_conversation(..., skip_if_busy=True)`, which refuses under the same session lock that pops the session, mirroring `reset`'s own guard. Probing from the consumer and tearing down afterwards would leave a window in which a channel message acquires the session's semaphore and begins streaming a reply the teardown then destroys — and the semaphore is the stricter signal anyway, since `provider.has_active_turn()` cannot see a turn holding the semaphore with no prompt in flight yet. A refusal returns False and changes nothing, replay flag and session map included, so the consumer leaves the flag armed for a later boundary. The sid clear runs in the SAME tick as the pop, with no await between them — deferring it past the shutdown awaits lets a concurrent channel turn map a SUCCESSOR session under the key while the old provider is still shutting down, and the clear then erases the successor's pointer instead of the discarded one. Sub-agent children are the other wait — `discard_conversation` releases the shared runtime they run on, so a running or queued child, or an in-flight completion-event delivery, also leaves the flag ARMED rather than killing the child's work. Both that consume and the route's 409 read one predicate, `chat_utils.subagents_attached_async`, so the two cannot drift. The queued flag is in-memory slot state: a gateway restart while it sits armed drops the reset the confirmation promised, which is accepted rather than persisted — the cost is one un-applied reset the caller can ask for again, against durable state for a transient intent. While a discard is armed the slot's queue is HELD, so a queued prompt is not answered by the conversation awaiting discard. One pure predicate decides it, `chat_utils_injected_rows.teardown_hold_active(state, slot)`, asked at the moment each site decides rather than stored, so no cached copy can go stale when the cause is cleared somewhere that knows nothing about the queue. The drain choke point (`_start_next_queued_turn`), an idle send, the synthesis dispatch and the completion-sound hint all read it. The turn-tail drain is unchanged and stays sign-out-only, so already-queued cron and sub-agent injections still drain behind a discard while the choke point holds the user entries. Four things do not hold: a pending project reset (every turn consumes it in `_turn_admit` before it acquires a session, and one whose key has no session declines forever); an entry asked for EXPLICITLY by id (the queued card's Run now) — both automatic sources of that same id stand down while the hold is on, the promotion of a waiting send and the terminal done-read's dispatch of an arrival, since naming an id turns the hold off; a patrol wake's discard behind a pending question or approval (it waits for the card, which only the answer run as a turn clears); and a turn that holds admission, because `skip_if_busy` cannot see one that has reserved but not yet acquired the session, so the consume defers and re-arms rather than handing that turn a fresh conversation. An idle send held behind a discard arms the retry and wakes it (`_wake_pending_reset_retry`), so the retry's next attempt runs at once rather than at its next tick, with every guard the tick has; the retry lands the discard and drains what it releases under `slot._lock`, with `_turn_admission_reserved` held across the drain's awaits so an idle sender cannot start a competing turn. When the drain starts nothing, it re-arms the synthesis fire-gate recheck when the queue is empty — that recheck reads the hold itself, because it reaches `_launch_synthesis` without passing the fire site. The hold is bounded even though the retry is not: after `_TEARDOWN_HOLD_MAX_TICKS` REFUSALS — the discard raising, or `skip_if_busy` turning it down — the retry gives the discard up, releases the queue and appends a system row saying replies may come from the conversation that could not be dropped. A wait on attached children, on a pending card or on an admitted turn is NOT a refusal and never spends the budget: each ends on its own, the sub-agent wait is deliberate (landing the discard there kills the children), and giving up would throw away a reset that was waiting correctly. So while sub-agent children stay attached, every message the person sends queues behind the discard with no limit on count or time, and Steer does not get past it: this is the intended behaviour, not a gap in the budget. The queue holds the person's words durably and they run once the children detach; the alternative, landing the discard to free the queue, kills the children's work. The budget belongs to ONE discard, restarting when the armed key changes, and the retry re-derives which case it is per attempt rather than recording it, so there is no second copy of the reason to go stale. The two risks are not equal — an unlanded reset serves the old project, which is wrong but answers, while a held queue answers nothing and reports nothing — so only the hold takes a budget, and the reset keeps the unbounded cadence a channel turn can outlast. `set_project`, `reset_conversation` and `suggest_followup` additionally require structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing — nor, for the last of the three, post a follow-up card into a human's session on the strength of a dashboard tab they merely inherited. `suggest_followup` is the case where the surface gate and the origin gate come apart: `_DASHBOARD_ONLY_DIRECTIVES` asks only whether an open tab EXISTS, which a cron or sub-agent turn riding a user's slot satisfies without a human having asked for a card, so membership in `_USER_ORIGIN_DIRECTIVES` is what makes the tool's own documented refusal true. Unlike `reset_conversation`, `suggest_followup` has no self-wake carve-out: only a turn a person sent can post a card, so the session's own sub-agent synthesis turns and monitor wakes are refused too. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
 
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 

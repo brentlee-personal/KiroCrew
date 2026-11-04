@@ -122,6 +122,7 @@ from kiro_crew.apps.registry import (
     _git_target_is_unsupported,
     _git_url_host,
     _loggable_git_transport_output,
+    _manifest_shell_platform_refusal,
     _owner_designated_repo_target,
     _pinned_registries,
     _registry_identity_key,
@@ -331,6 +332,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.apps.routes_lifecycle import (  # noqa: F401
         _app_may_run_after_install,
+        _backend_platform_refusal,
         _check_min_version,
         _deregister_app_off_loop,
         _redact_warning,

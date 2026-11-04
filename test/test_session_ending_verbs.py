@@ -21,6 +21,7 @@ from session_helpers import (  # noqa: F401 -- the fixture is requested by name
 )
 
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.ids import UNALLOCATABLE_PID
 from kiro_crew.testing.wait import async_wait_until, await_until
 
 
@@ -343,7 +344,6 @@ class TestResetWithPid:
 
     @pytest.mark.asyncio
     async def test_reset_with_pid_survives_shutdown_force_kills(self, cfg):
-        """reset() force-kills when PID survives shutdown."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
@@ -375,9 +375,7 @@ class TestResetWithPid:
         # No _client, but has _proc (CC provider style)
         provider._client = None
         mock_proc = AsyncMock()
-        # flake-ok: patched os.kill makes POSIX read pid 99999 as gone so no kill runs; the Windows probe is unpatched; moved verbatim; tracked for a de-flake pass
-        # nosemgrep: kirocrew.mock-pid-allocatable -- pre-existing fabricated pid moved verbatim; patched os.kill keeps the POSIX kill path unreached; tracked for a de-flake pass
-        mock_proc.pid = 99999
+        mock_proc.pid = UNALLOCATABLE_PID
         mock_proc.returncode = None
         provider._proc = mock_proc
 
@@ -391,7 +389,9 @@ class TestResetWithPid:
 
         provider.shutdown.assert_awaited_once()
         assert not mgr.has_session("k1")
-        assert 99999 in [c.args[0] for c in probe.call_args_list], "the _proc pid is probed"
+        assert UNALLOCATABLE_PID in [
+            c.args[0] for c in probe.call_args_list
+        ], "the _proc pid is probed"
 
     @pytest.mark.asyncio
     async def test_reset_child_sweep(self, cfg):
@@ -931,6 +931,51 @@ class TestDiscardConversation:
         assert await mgr.discard_conversation("k1", replay=False, skip_if_busy=True) is False
 
         assert mgr.consume_replay_suppression("k1") is False
+
+    @pytest.mark.asyncio
+    async def test_refuse_if_closes_a_window_skip_if_busy_cannot_see(self, cfg):
+        """A caller's busy can live off-session, so it is asked in the same lock hold as the pop."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        assert provider.has_active_turn() is False
+        discarded = await mgr.discard_conversation(
+            "k1", replay=False, skip_if_busy=True, refuse_if=lambda: True
+        )
+        assert discarded is False
+        provider.shutdown.assert_not_awaited()
+        assert mgr.has_session("k1"), "the refusal must leave the session intact"
+        assert mgr.consume_replay_suppression("k1") is False, "nor move the replay flag"
+
+    @pytest.mark.asyncio
+    async def test_refuse_if_answering_no_leaves_the_teardown_alone(self, cfg):
+        """Positive control: a hook wired to refuse always would strand every teardown."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        discarded = await mgr.discard_conversation(
+            "k1", replay=False, skip_if_busy=True, refuse_if=lambda: False
+        )
+        assert discarded is True
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_refuse_if_is_asked_before_the_pop(self, cfg):
+        """Asked after the pop, a refusal could not undo it: the session must still be registered."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        still_registered: list[bool] = []
+
+        def ask() -> bool:
+            still_registered.append(mgr.has_session("k1"))
+            return True
+
+        assert (
+            await mgr.discard_conversation("k1", replay=False, skip_if_busy=True, refuse_if=ask)
+            is False
+        )
+        assert still_registered == [True]
 
     @pytest.mark.asyncio
     async def test_skip_if_busy_proceeds_once_the_turn_releases(self, cfg):

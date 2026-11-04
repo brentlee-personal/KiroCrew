@@ -379,6 +379,11 @@ class TestVoiceConfig:
             assert resp.status == 200
             # Invalid provider ignored — unchanged
             assert mock_vc.provider == "system"
+            # ...and named, so the caller does not read the 200 as saved.
+            body = await resp.json()
+            assert body["ok"] is True
+            assert [w["code"] for w in body["warnings"]] == ["voice_provider_unknown"]
+            assert body["warnings"][0]["field"] == "provider"
 
     @pytest.mark.asyncio
     async def test_put_config_unhashable_engine_does_not_500(self, tmp_path, monkeypatch):
@@ -405,9 +410,11 @@ class TestVoiceConfig:
         monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
         state = _make_state(tmp_path)
         async with TestClient(TestServer(_make_voice_app(state))) as client:
-            for bad in ({"engine": ["neural"]}, {"engine": {"x": 1}}):
+            for bad in ({"engine": ["neural"]}, {"engine": {"x": 1}}, {"engine": "turbo"}):
                 resp = await client.put("/api/voice/config", json=bad)
                 assert resp.status == 200  # not a 500
+                body = await resp.json()
+                assert [w["code"] for w in body["warnings"]] == ["voice_engine_unknown"]
             # Unhashable/non-str engine ignored — unchanged
             assert mock_vc.default_engine == "generative"
 
@@ -438,6 +445,71 @@ class TestVoiceConfig:
             resp = await client.put("/api/voice/config", json={"provider": ["polly"]})
             assert resp.status == 200
             assert mock_vc.provider == "system"  # unchanged, not crashed
+
+    @pytest.mark.asyncio
+    async def test_put_config_saves_the_rest_of_a_patch_beside_an_unknown_provider(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            global_enabled=False,
+            auto_speak=False,
+            provider="system",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            system_voice="",
+            language_code="",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({}))
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.put(
+                "/api/voice/config",
+                json={"provider": "bogus", "engine": "neural", "voice": "Joanna"},
+            )
+            assert resp.status == 200
+            body = await resp.json()
+        assert [w["field"] for w in body["warnings"]] == ["provider"]
+        assert mock_vc.provider == "system"
+        assert mock_vc.default_engine == "neural"
+        assert mock_vc.default_voice == "Joanna"
+        saved = json.loads(cfg_path.read_text())["voice_reply"]
+        assert "provider" not in saved
+
+    @pytest.mark.asyncio
+    async def test_put_config_with_only_known_values_carries_no_warnings(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        mock_vc = MagicMock(
+            global_enabled=False,
+            auto_speak=False,
+            provider="system",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="0%",
+            aws_profile="",
+            region="",
+            system_voice="",
+            language_code="",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({}))
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.config_path", lambda: cfg_path)
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.put("/api/voice/config", json={"engine": "neural"})
+            assert resp.status == 200
+            assert await resp.json() == {"ok": True}
 
     @pytest.mark.asyncio
     async def test_put_config_preserves_unmanaged_voice_reply_keys(self, tmp_path, monkeypatch):
@@ -784,6 +856,92 @@ class TestVoiceSynthesize:
             for secret in ("111122223333", "999988887777", "polly-reader"):
                 assert secret not in carried["error"]
         spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_polly_aws_rejection_reaches_the_client_with_its_code(
+        self, tmp_path, monkeypatch
+    ):
+        """Consent stands, but AWS rejects every sentence: name the cause once.
+
+        The real stream runs with a granted consent, and the mocked AWS CLI
+        exits nonzero (a region that does not support the engine). The stream
+        must fail at the first sentence with ``voice_polly_rejected`` -- fixed
+        text, the CLI's stderr kept out of it -- rather than skip each sentence
+        into the generic "no audio" notice.
+        """
+        from kiro_crew import aws_consent
+        from kiro_crew.config.loader import config_dir
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        config_dir().mkdir(parents=True, exist_ok=True)
+        _consent_to_polly(profile="polly-reader", region="us-east-1")
+
+        async def _granted(_profile, _region, *, use_cache=True):
+            return aws_consent.Identity(ok=True, account="111122223333")
+
+        monkeypatch.setattr(aws_consent, "probe_identity", _granted)
+        # The AWS CLI must resolve so the argv is built and the spawn is reached;
+        # the spawn itself returns a nonzero proc, so no real CLI runs.
+        monkeypatch.setattr("kiro_crew.voice_reply.resolve_aws_bin", lambda: "aws")
+        monkeypatch.setattr(
+            "kiro_crew.voice_reply.shutil.which",
+            lambda name, *a, **k: "/usr/bin/aws" if name == "aws" else None,
+        )
+        monkeypatch.setattr("kiro_crew.voice_reply.wrap_argv", lambda argv, **k: (list(argv), None))
+        monkeypatch.setattr("kiro_crew.voice_reply.cgroup_scope_argv", lambda argv: list(argv))
+        rejected_proc = AsyncMock()
+        rejected_proc.communicate = AsyncMock(
+            return_value=(
+                b"",
+                # The AWS CLI stderr reported for this failure.
+                b"An error occurred (ValidationException) when calling the "
+                b"SynthesizeSpeech operation: The selected engine is not supported "
+                b"in this region",
+            )
+        )
+        rejected_proc.returncode = 255
+        rejected_proc.kill = MagicMock()
+        rejected_proc.wait = AsyncMock()
+
+        async def _spawn(*_argv, **_kw):
+            return rejected_proc
+
+        monkeypatch.setattr("kiro_crew.voice_reply.create_subprocess_limited", _spawn)
+        mock_vc = MagicMock(
+            provider="polly",
+            default_voice="Ruth",
+            default_engine="generative",
+            default_rate="100%",
+            default_pitch="+0%",
+            aws_profile="polly-reader",
+            region="us-east-1",
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.chat_voice._vc", mock_vc)
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        async with TestClient(TestServer(_make_voice_app(state))) as client:
+            resp = await client.post(
+                "/api/voice/synthesize", json={"text": "First. Second.", "slot": "s1"}
+            )
+            assert resp.status == 502
+            data = await resp.json()
+        event, payload = state.broadcast_ws.call_args[0]
+        assert event == "voice_error"
+        assert payload["slot"] == "s1"
+        fixed = (
+            "Amazon Polly does not offer the selected voice or engine in the "
+            "selected AWS region. In the Text-to-speech settings, pick a different "
+            "Voice, Engine, or Region."
+        )
+        for carried in (data, payload):
+            assert carried["code"] == "voice_polly_rejected"
+            assert carried["error"] == fixed
+            assert "ValidationException" not in carried["error"]
+            # The client's own engine is unaffected by the AWS region, so the
+            # rejection carries the cleaned text a manual Read aloud speaks.
+            assert carried["speakable"] == "First. Second."
 
 
 def _consent_to_polly(*, profile: str, region: str) -> None:

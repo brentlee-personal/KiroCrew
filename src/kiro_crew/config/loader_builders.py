@@ -68,7 +68,6 @@ from kiro_crew.config.sections import (
     _normalize_acp_backend,
     _normalize_jail,
     _normalize_yolo_duration,
-    _port_or_unset,
     _read_skip_permissions,
     _safe_bool,
     _safe_float,
@@ -543,7 +542,9 @@ _MEMBER_HARNESS_KEY = "member_acp_backend"
 
 #: The ``agent`` fields that hold a harness id, spelled in the config-file
 #: vocabulary on disk and in ``to_dict()`` and as runtime ids on the dataclass.
-_HARNESS_CHOICE_KEYS: tuple[str, ...] = ("acp_backend", "member_acp_backend")
+# ``acp_failover`` is here for the same reason: its loaded value drops chain
+# members this deployment cannot select, and a save must not erase them.
+_HARNESS_CHOICE_KEYS: tuple[str, ...] = ("acp_backend", "member_acp_backend", "acp_failover")
 
 
 def _stored_agent_dict(agent: AgentConfig) -> dict:
@@ -642,6 +643,17 @@ def _strands_str_or_empty(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _builtin_adoption_markers(raw: object) -> dict[str, dict[str, object]]:
+    """``agent.apps_builtin_adoption``: the gateway-written adoption markers, validated.
+
+    The validator is the adoption module's own, so the loader and the base-file
+    reader (``apps.builtin_adoption_state``) cannot disagree on what a marker is.
+    """
+    from kiro_crew.apps.builtin_adoption_markers import coerce_adoption_markers
+
+    return {name: dict(marker) for name, marker in coerce_adoption_markers(raw).items()}
+
+
 def _build_agent_config(agent_data: dict) -> AgentConfig:
     section = _sections.SectionReader(AgentConfig, agent_data)
     return AgentConfig(
@@ -661,6 +673,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         mcp_quarantine_after_failures=section.read("mcp_quarantine_after_failures", _safe_int),
         acp_backend=_read_backend_choice(section, agent_data, "acp_backend"),
         member_acp_backend=_read_backend_choice(section, agent_data, "member_acp_backend"),
+        acp_failover=_sections.normalize_acp_failover(section.get("acp_failover")),
         kas_bundle=section.read("kas_bundle", _safe_bool),
         kas_persist_mcp_sign_in=section.read("kas_persist_mcp_sign_in", _safe_bool),
         kas_bundle_url=_sections.coerce_kas_bundle_url(section.get("kas_bundle_url")),
@@ -716,6 +729,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             if isinstance(_applied := section.get("apps_default_installs_applied"), list)
             else section.default("apps_default_installs_applied")
         ),
+        apps_builtin_adoption=_builtin_adoption_markers(section.get("apps_builtin_adoption")),
         apps_ui_stream_timeout_secs=section.read("apps_ui_stream_timeout_secs", _safe_int, 5, 600),
         jail=_normalize_jail(section.get("jail")),
         dangerously_skip_permissions=_read_skip_permissions(agent_data),
@@ -1191,11 +1205,9 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         session_card_source_links=section.read("session_card_source_links", _safe_bool),
         default_memory_mode=_default_memory_mode_from(section.get("default_memory_mode")),
         widget_density=section.get("widget_density"),
-        use_builtin_browser=section.read("use_builtin_browser", _safe_bool),
         browser_local_origins=_sections.coerce_browser_local_origins(
             section.get("browser_local_origins")
         ),
-        browser_view_port=_port_or_unset(section.get("browser_view_port")),
         verbosity=_sections.normalize_verbosity(section.get("verbosity")),
         link_previews=section.read("link_previews", _safe_bool),
         tail_fork_enabled=section.get("tail_fork_enabled"),

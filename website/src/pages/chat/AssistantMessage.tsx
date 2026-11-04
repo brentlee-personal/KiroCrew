@@ -4,6 +4,7 @@ import { Copy, ClipboardType, Check, Code, Eye, ClipboardList, CheckCircle, Refr
 import { lazy, Suspense } from 'react'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../../components/ui/dropdown-menu'
 import MessageContextMenu, { type MessageMenuItem } from './MessageContextMenu'
+import MessageActionMenuItems, { useMessageActionsFor, useMessageActionsLoadFailed } from '../../messageActions/MessageActionMenuItems'
 import { copyRichToClipboard, copyToClipboard } from '../../utils/clipboard'
 import { markdownToCleanHtml } from '../../components/markdown/richTextClipboard'
 import { stripKeepVisibleMarker } from '../../app-sdk/protocol/keepVisibleMarker'
@@ -13,6 +14,7 @@ import { isTouchDevice } from '../../utils/isTouchDevice'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import MessageErrorBoundary from '../../components/MessageErrorBoundary'
 import SelectionToolbar, { useSelectionActions } from '../../components/SelectionToolbar'
+import { useAppSelectionActions } from '../../selectionActions/useAppSelectionActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
 import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
@@ -295,6 +297,10 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
     setRawMode(!rawMode)
   }
   const selectionActions = useSelectionActions(onQuote, onAsk)
+  // App items (`contributes.selectionActions`) read this reply through the typed
+  // `chat` source: the text the toolbar snapshotted, never the document selection.
+  // They sit in their own toolbar row, so the host row never grows.
+  const appSelectionActions = useAppSelectionActions('chat')
   const touch = isTouchDevice()
   const toolbarActions = touch ? selectionActions.filter(a => a.id !== 'copy') : selectionActions
 
@@ -429,7 +435,11 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // Same text Copy copies: the keep-visible marker is a transcript control,
   // not part of the reply, so a quote must not hand it to the model.
   const quoteShown = () => onQuoteMessage?.(quotableText)
-  const menuAvailable = oldMenuContext || hasSpeak || threadRow || quoteOffered
+  // App message actions (`contributes.messageActions`) the owner approved for
+  // replies: rows at the end of More, never row buttons.
+  const appActions = useMessageActionsFor('assistant', !isStreaming && showFooter && quotableText.length > 0)
+  const appActionsFailed = useMessageActionsLoadFailed(!isStreaming && showFooter && quotableText.length > 0)
+  const menuAvailable = oldMenuContext || hasSpeak || threadRow || quoteOffered || appActions.length > 0 || appActionsFailed
   useEffect(() => {
     if (!menuAvailable || isStreaming || !showFooter) setOverflowOpen(false)
   }, [isStreaming, menuAvailable, showFooter])
@@ -438,7 +448,10 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
   // replies too. Existing overflow footers retain their familiar inline Copy.
   // With Quote offered, Copy always keeps its row button, right after the seat.
   const copyInMenu = !quoteOffered && (hasSpeak || threadRow) && !oldMenuContext
-  const rawInMenu = threadRow || quoteOffered
+  // A More that only app actions (or their load failure) open is a new footer
+  // control, so Raw view moves into it: the row stays Copy + More, two controls.
+  const appsOnlyMenu = !(oldMenuContext || hasSpeak || threadRow || quoteOffered) && (appActions.length > 0 || appActionsFailed)
+  const rawInMenu = threadRow || quoteOffered || appsOnlyMenu
   // With Quote offered, Copy link and Pin fold into More as well. Same order
   // inside the menu as UserMessage's: Quote, Copy link, Pin.
   const linkPinInMenu = quoteOffered
@@ -624,6 +637,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
               </span>
             </DropdownMenuItem>
           )}
+          <MessageActionMenuItems actions={appActions} messageRole="assistant" markdown={quotableText} anchor={() => contentRef.current} />
         </DropdownMenuContent>
       </DropdownMenu>
   ) : null
@@ -709,7 +723,7 @@ const AssistantMessage = memo(function AssistantMessage({ content, isStreaming, 
           and Copy callout around the selection, and a row drawn on top of them
           took the taps meant for the handles. Copy is left to that callout, so
           the dock carries only what the platform cannot do (Quote, Ask). */}
-      {toolbarActions.length > 0 && <SelectionToolbar containerRef={contentRef} actions={toolbarActions} dock={touch} copyOnSelect={copyOnSelect} />}
+      {toolbarActions.length + appSelectionActions.length > 0 && <SelectionToolbar containerRef={contentRef} actions={toolbarActions} appActions={appSelectionActions} dock={touch} copyOnSelect={copyOnSelect} />}
     </div>
     </MessageContextMenu>
     {/* Directly under the bubble, above the file chips: the strip says how THIS

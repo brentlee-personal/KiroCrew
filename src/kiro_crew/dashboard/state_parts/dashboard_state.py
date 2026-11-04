@@ -21,7 +21,7 @@ from kiro_crew.config.loader import DASHBOARD_PORT, config_dir
 from kiro_crew.dashboard import pinned_session_order
 from kiro_crew.dashboard.folder_repository import FOLDERS_FILE
 from kiro_crew.dashboard.interaction_coordinator import ApprovalCoordinator, QuestionCoordinator
-from kiro_crew.dashboard.slot_registry import SlotRegistry
+from kiro_crew.dashboard.slot_registry import SlotRegistry, TakeoverWatch, TruncationClaim
 from kiro_crew.dashboard.state_parts import dashboard_services as _dashboard_services
 from kiro_crew.dashboard.state_parts import session_events as _session_events
 from kiro_crew.dashboard.state_parts import sidebar_stores as _sidebar_stores
@@ -115,8 +115,9 @@ class DashboardState:
     _folders_lock: LoopBoundLock
     _folders_generation: int
     _tags_generation: int
-    #: Set lazily by ``push_lineage_patch``: key -> (parent, lineage_pending, crew stamps).
-    _lineage_sent: dict[str, tuple[Any, bool, tuple[str, bool]]]
+    #: Set lazily by ``push_lineage_patch``: key -> (parent, lineage_pending, crew
+    #: stamps, mate stamps).
+    _lineage_sent: dict[str, tuple[Any, bool, tuple[str, bool], tuple[str, str]]]
 
     # Class-level defaults, NOT just __init__ assignments. push_slots_update and
     # _persist_open_slots read these on every call, and a partially-constructed
@@ -495,7 +496,6 @@ class DashboardState:
         self.unrestored_slot_keys: set[str] = set()
         self.deferred_member_slot_keys: set[str] = set()
         self._notification_log: list[dict[str, Any]] = _load_notifications()
-        self._unread_count: int = 0
         self._notification_coordinator = _new_notification_coordinator(
             web_push_fanout=lambda note: self._fan_out_web_push(note)
         )
@@ -585,6 +585,33 @@ class DashboardState:
         self._warm_task_brief_abandoned: set[str] = set()
         # Threads whose brief has posted its opener: leaving keeps the brief.
         self._warm_task_brief_opened: set[str] = set()
+        # Truncating-save claims, keyed by slot map key (see
+        # ``TruncationClaim``). Written from the save's worker thread and from
+        # the event loop's publication/resume paths, so transitions go through
+        # ``_truncation_claim_mutex`` — the GIL does not make the
+        # check-then-set arbitration atomic. The mutex guards in-memory
+        # transitions only and is never held across I/O, so neither side ever
+        # waits on it for more than a dict operation.
+        self._truncation_claims: dict[str, list[TruncationClaim]] = {}
+        # Refcounted takeover watches, keyed by slot map key (see
+        # ``TakeoverBasis``). An entry exists only while a truncating save is
+        # in dispatch or in flight for its key — the dispatcher opens it at
+        # its last synchronous instant and closes it once the save's outcome
+        # is in hand — so the table is bounded by in-flight saves, not by the
+        # keys the process has published. Written from save worker threads and
+        # from the event loop's publication/resume paths, so every transition
+        # goes through ``_truncation_claim_mutex`` — the GIL does not make the
+        # check-then-set arbitration atomic. The mutex guards in-memory
+        # transitions only and is never held across I/O, so neither side ever
+        # waits on it for more than a dict operation.
+        self._takeover_watches: dict[str, TakeoverWatch] = {}
+        # Loop-side waiters for a key's takeover ordering to settle
+        # (``SlotRegistry.await_takeover_ordering_settled``), keyed by slot map
+        # key: ``(loop, future)`` pairs resolved through their loop by whichever
+        # save worker retires the last pending basis or claim. Guarded by the
+        # same mutex; an entry lives only while a resume is waiting.
+        self._takeover_settle_waiters: dict[str, list[tuple[Any, Any]]] = {}
+        self._truncation_claim_mutex = threading.Lock()
         self._slack_to_slot: dict[str, str] = {}  # Slack session_key → slot name
         # Live OPTIONS controls, keyed by the SESSION KEY that owns them.
         #
@@ -640,6 +667,9 @@ class DashboardState:
         # hand-edit left in a shape the loader could not validate (mirrors the
         # cron-folder unparsed-entry preservation).
         self._unparsed_chat_pin_entries: list[Any] = []
+        # True while a present chat_pins.json failed to parse at load: the
+        # in-memory list is empty but the file is not, so save_chat_pins refuses.
+        self._chat_pins_load_failed: bool = False
         # Serializes pin mutation + persistence so concurrent requests cannot
         # interleave snapshots and replace chat_pins.json out of order.
         # LoopBoundLock, not asyncio.Lock: DashboardState outlives any
@@ -673,6 +703,10 @@ class DashboardState:
         # a legitimately-empty vocabulary (user deleted every tag) must still
         # prune dangling ids while an unreadable one must not wipe anything.
         self._tags_authoritative: bool = False
+        # True while a present tags.json / tag_boards.json failed to load: the
+        # file holds rows this process never saw, so that store's writers refuse.
+        self._tags_load_failed: bool = False
+        self._tag_boards_load_failed: bool = False
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
         # Malformed tag-board (sidebar column) entries dropped at load time,
@@ -705,13 +739,6 @@ class DashboardState:
         self._refine_error: str = ""
         self._terminal_sessions: dict[str, Any] = {}  # PTY sessions for CLI panel
         self._terminal_reaper: asyncio.Task | None = None  # type: ignore[type-arg]
-        self._browser_snapshot_pruner: asyncio.Task | None = None  # type: ignore[type-arg]
-        self._browser_install_task: asyncio.Task | None = None  # type: ignore[type-arg]
-        # The one browser install job (browser_cli.install_job.BrowserInstallJob)
-        # and the InstallScope owning its subprocesses. In memory only: a gateway
-        # start has no job, so a "running" state never outlives its process.
-        self._browser_install_job: Any = None
-        self._browser_install_scope: Any = None
         self._terminal_title_poller: asyncio.Task | None = None  # type: ignore[type-arg]
         # Background reconciler that surfaces channel-originated sessions
         # (slack:<ts>, discord:…) as chat slots. Held to prevent GC.
@@ -744,8 +771,8 @@ class DashboardState:
         self._prevent_sleep_task: asyncio.Task | None = None  # type: ignore[type-arg]
         # Drops the inhibitor's pre-exec stop; run by the cleanup hook.
         self._prevent_sleep_unregister: Callable[[], None] | None = None
-        # Drops the browser view's pre-exec stop; run by its cleanup hook.
-        self._browser_view_unregister: Callable[[], None] | None = None
+        # Drops the Browser Harness supervisor's pre-exec stop; run by its cleanup hook.
+        self._browser_harness_unregister: Callable[[], None] | None = None
 
         # Knowledge Library
         self._knowledge_store: "KnowledgeStore | None" = None  # Lazy-initialized on first access
@@ -1235,6 +1262,7 @@ class DashboardState:
     broadcast_ws = _slots_push.broadcast_ws
     broadcast_context_usage = _slots_push.broadcast_context_usage
     deliver_ws_owners = _slots_push.deliver_ws_owners
+    deliver_ws_owners_bytes = _slots_push.deliver_ws_owners_bytes
     broadcast_ws_owners = _slots_push.broadcast_ws_owners
     ws_client_count = _slots_push.ws_client_count
     dashboard_user_ws_count = _slots_push.dashboard_user_ws_count
@@ -1245,7 +1273,6 @@ class DashboardState:
     fold_watch_routing = _slots_push.fold_watch_routing
     fold_apply_watch = _slots_push.fold_apply_watch
     add_fold_watch_listener = _slots_push.add_fold_watch_listener
-    broadcast_browser_event = _slots_push.broadcast_browser_event
     register_ws = _slots_push.register_ws
     send_members_subscribed = _slots_push.send_members_subscribed
     unregister_ws = _slots_push.unregister_ws

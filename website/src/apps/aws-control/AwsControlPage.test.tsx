@@ -516,8 +516,8 @@ describe('overview pane', () => {
   })
 
   it('each metric card opens the pane that owns its figure', async () => {
-    // StatCard lifts on hover whether or not it is a target, so a card that
-    // went nowhere signalled a click it did not have.
+    // A metric card restates a figure some pane owns, so the card is the way
+    // through to that pane.
     renderWithProviders(<AwsControlPage />)
     fireEvent.click(await screen.findByTestId('overview-stat-spend'))
     expect(screen.getByTestId('rail-usage').getAttribute('aria-current')).toBe('page')
@@ -974,7 +974,9 @@ describe('accounts pane', () => {
     // The totals strip answers "how much is connected and is it healthy".
     expect(screen.getByTestId('accounts-totals')).toHaveTextContent(
       i18nT('apps.awsControl.page.totals_summary', {
-        accounts: fmtNumber(2), keys: fmtNumber(2), healthy: fmtNumber(1),
+        count: 2,
+        accounts: fmtNumber(2),
+        keys: i18nT('apps.awsControl.page.keys_healthy', { count: 2, n: fmtNumber(2), healthy: fmtNumber(1) }),
       }),
     )
     // The selected account's connection keys live on this pane too.

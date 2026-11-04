@@ -190,6 +190,24 @@ class TestCatalog:
                 assert "==" in spec or "/archive/" in spec, line
                 assert not any(op in spec for op in (">", "<", "~=", "!=")), line
 
+    def test_plumb_pins_a_jevk5_that_answers_a_choice_of_any_size(self):
+        """skills.select offers up to MAX_CANDIDATES skills plus a "none" option in one
+        Choice. jevk5 before v0.2.2 letters at most 16 options and drops the connection
+        on a 17th, so every larger menu came back as a provider error. Each commit here
+        was checked to answer a 30-option Choice through its own server."""
+        from kiro_crew.decisions.local_runtime import SERVERS_DIR
+        from kiro_crew.decisions.points.skills_select import MAX_CANDIDATES
+
+        any_size = {"1ca7762ec33f94ad3161cdf464bb591a2414097d": "v0.2.2"}
+        plumb = next(m for m in local_models.LOCAL_MODELS if m.id == "plumb-4b")
+        lock = (SERVERS_DIR / plumb.requirements).read_text(encoding="utf-8")
+        pins = [line for line in lock.splitlines() if line.startswith("jevk5 @ ")]
+
+        assert MAX_CANDIDATES + 1 > 16
+        assert len(pins) == 1, pins
+        commit = pins[0].rsplit("/", 1)[1].removesuffix(".tar.gz")
+        assert commit in any_size, commit
+
     def test_every_weight_file_is_pinned_and_served_from_the_model_cdn(self):
         for m in local_models.LOCAL_MODELS:
             assert m.files, m.id
@@ -410,6 +428,10 @@ class TestProviderRouteGet:
         assert payload["loopback"] is False
         assert payload["runtime"]["state"] == "idle"
         assert all(p["installed"] is False for p in payload["presets"])
+        gpu = payload["plumb_gpu"]
+        assert gpu["enabled"] is False
+        assert gpu["available"] is (gpu["reason"] == "")
+        assert gpu["reason"] in {"", "no_driver", "driver_too_old", "unsupported_platform"}
 
     @pytest.mark.asyncio
     async def test_reports_what_is_downloaded_and_what_the_runtime_is_doing(self, audit, runtime):
@@ -456,6 +478,7 @@ class TestProviderRoutePut:
             {"preset": "laya", "url": "http://127.0.0.1:1/v1/systemone"},
             {"preset": "jev", "port": 8102},
             {"preset": "laya", "port": 9001},
+            {"preset": "plumb-4b", "gpu": True},
             {"preset": "nope"},
             {"preset": None},
             {},
@@ -467,6 +490,7 @@ class TestProviderRoutePut:
             "a-url",
             "port-on-hosted",
             "port-on-local",
+            "gpu-mixed-with-preset",
             "unknown-preset",
             "null-preset",
             "empty",
@@ -1028,3 +1052,78 @@ class TestStartupResumeIsSerialisedWithSwitches:
             assert not pending.done() and calls == []
         assert await await_until(pending, what="the resume finishing after the switch") == "laya"
         assert calls == ["resume"]
+
+
+class TestPlumbGpuSwitch:
+    @pytest.mark.asyncio
+    async def test_turning_it_on_without_a_gpu_writes_nothing(
+        self, audit, config_file, runtime, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_provider_put
+        from kiro_crew.decisions import local_torch
+
+        monkeypatch.setattr(local_torch, "cuda_unavailable_reason", lambda: "no_driver")
+        resp = await api_decisions_provider_put(_request(body={"gpu": True}))
+        assert resp.status == 409
+        assert json.loads(resp.text)["code"] == "decisions_gpu_unavailable"
+        assert config_file[1]() == {}
+        assert runtime.calls == []
+
+    @pytest.mark.asyncio
+    async def test_turning_it_on_restarts_plumb_on_the_cuda_path(
+        self, audit, config_file, keystone, not_denied, runtime, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_provider_put
+        from kiro_crew.decisions import local_torch
+
+        monkeypatch.setattr(local_torch, "cuda_unavailable_reason", lambda: None)
+        await api_decisions_provider_put(_request(body={"preset": "plumb-4b"}))
+        runtime.calls.clear()
+        resp = await api_decisions_provider_put(_request(body={"gpu": True}))
+        assert resp.status == 200
+        assert config_file[1]()["gpu"] is True
+        body = json.loads(resp.text)
+        assert body["plumb_gpu"] == {"available": True, "enabled": True, "reason": ""}
+        assert runtime.calls == [("activate", "plumb-4b", 8102)]
+
+    @pytest.mark.asyncio
+    async def test_turning_it_off_restarts_plumb_on_the_cpu_path(
+        self, audit, config_file, keystone, not_denied, runtime, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_provider_put
+        from kiro_crew.decisions import local_torch
+
+        monkeypatch.setattr(local_torch, "cuda_unavailable_reason", lambda: None)
+        await api_decisions_provider_put(_request(body={"preset": "plumb-4b"}))
+        await api_decisions_provider_put(_request(body={"gpu": True}))
+        runtime.calls.clear()
+        resp = await api_decisions_provider_put(_request(body={"gpu": False}))
+        assert resp.status == 200
+        assert config_file[1]()["gpu"] is False
+        assert json.loads(resp.text)["plumb_gpu"]["enabled"] is False
+        assert runtime.calls == [("activate", "plumb-4b", 8102)]
+
+    @pytest.mark.asyncio
+    async def test_another_preset_is_left_running(
+        self, audit, config_file, keystone, not_denied, runtime, monkeypatch
+    ):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_provider_put
+        from kiro_crew.decisions import local_torch
+
+        monkeypatch.setattr(local_torch, "cuda_unavailable_reason", lambda: None)
+        await api_decisions_provider_put(_request(body={"preset": "laya"}))
+        runtime.calls.clear()
+        resp = await api_decisions_provider_put(_request(body={"gpu": True}))
+        assert resp.status == 200
+        assert config_file[1]()["gpu"] is True
+        assert runtime.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_string_is_refused(self, audit, config_file, runtime):
+        from kiro_crew.dashboard.handlers.decisions import api_decisions_provider_put
+
+        resp = await api_decisions_provider_put(_request(body={"gpu": "true"}))
+        assert resp.status == 400
+        assert json.loads(resp.text)["code"] == "decisions_provider_invalid_body"
+        assert config_file[1]() == {}
+        assert runtime.calls == []

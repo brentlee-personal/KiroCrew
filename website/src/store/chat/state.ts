@@ -155,9 +155,9 @@ export interface SideState {
   createdAt: string
   /** The banner counts the parent turns newer than `createdAt` instead of
    *  comparing with `openedAtTurnCount`, because the count this tab held when the
-   *  conversation began is no baseline: the conversation was restored, or its
-   *  first row landed in an empty state made earlier, while this tab could be
-   *  showing another slot or still loading this one. Counted at render: the
+   *  conversation began is no baseline: the conversation was restored, its
+   *  first row landed in an empty state made earlier, or it began while this tab
+   *  was showing another slot or still loading this one. Counted at render: the
    *  parent transcript can load later. */
   countsTurnsSinceCreated?: boolean
   /** The answer of this run streamed before this tab joined it, so its deltas
@@ -578,6 +578,11 @@ export interface ChatState {
    *  queue edit for an entry this tab has no card for get kept
    *  (`SideState.editedBeforeRestore`). */
   slotSideReading?: Record<string, boolean>
+  /** Slots whose side conversation another tab closed (`chat.side_closed` naming
+   *  another tab) while this tab showed it or held one of its questions, so the
+   *  panel says why it emptied. `sideClose` and a new conversation clear it, so
+   *  this tab's own Refresh context shows nothing new. */
+  slotSideClosedElsewhere?: Record<string, boolean>
   slotMessages: Record<string, ChatMessage[]>
   /** Fresh `has_more` for a BACKGROUND pane, written by every bounded warm.
    *  The pane's own query is staleTime:Infinity, so its has_more freezes at

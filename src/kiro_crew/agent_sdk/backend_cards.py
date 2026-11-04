@@ -378,6 +378,18 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_DIRECT_CLIENT_CHILD_CALLS_MARKED": (
+        "whether a deny-rule refusal on the direct client may become an override "
+        "card. A non-member keeps today's refusal, which the person already meets "
+        "with its own reason, and the card appears where it applies, so a card "
+        "line would repeat what the refusal says"
+    ),
+    "ACP_BACKENDS_SHARED_RUNTIME_CHILD_CALLS_MARKED": (
+        "whether a deny-rule refusal on the shared runtime may become an override "
+        "card. A non-member keeps today's refusal, which the person already meets "
+        "with its own reason, and the card appears where it applies, so a card "
+        "line would repeat what the refusal says"
+    ),
     "ACP_BACKENDS_TEMPLATE_ADDITIONS_AT_SPAWN": (
         "whether a server the user approved for a template Crew does not own reaches "
         "that template's sessions here. The approval card asks the same question for "
@@ -655,6 +667,13 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "caller asks the right path; a wrong membership is a spawn under the "
         "WRONG IDENTITY -- kas or codex under a bare kiro-cli spawn -- which is a "
         "defect, not an absent feature a reader choosing a harness acts on"
+    ),
+    "ACP_BACKENDS_REMOTE_MCP_OAUTH": (
+        "whether a remote MCP entry's oauth block (a pre-registered OAuth "
+        "client) reaches the engine. The Connections page already says it where "
+        "it matters, on each pre-registered provider's card, and the answer "
+        "covers only those providers: a server that registers its own client "
+        "signs in on every backend that serves remote MCP at all"
     ),
     "ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP": (
         "whether a session/new stdio element whose command cannot be found is left "

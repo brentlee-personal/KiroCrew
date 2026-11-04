@@ -68,7 +68,7 @@ GET    /meetings/{id}/translations[?since=N]   translated lines, cursor-paged
 PUT    /meetings/{id}/outputs       replace one agent's minutes  {agent_id, content}
 DELETE /meetings/{id}/outputs       discard the edit, serve the agent's own output {agent_id}
 GET    /meetings/{id}/note          the user's own note + its absolute path
-PUT    /meetings/{id}/note          {content} — replace it
+PUT    /meetings/{id}/note          {content, editor?, seq?} — replace it
 POST   /meetings/{id}/note/images   multipart — one pasted screenshot
 POST   /meetings/{id}/attachments   {action: add|remove, attachments[]|index}
 POST   /meetings/{id}/agents        {agent_id, enable} — toggle mid-meeting
@@ -180,6 +180,15 @@ Minutes edits share the metadata transaction with deletion as well: the meeting
 existence check and sidecar write/delete are one unit, so a stale PUT cannot recreate
 an orphan `edits/` directory. Deletion also waits for task filing's
 provider-to-local-record transaction.
+
+`tasks.json` is agent-written, so a malformed file is expected. Reads for display
+(`store.read_tasks`) accept one leading UTF-8 byte-order mark and show any other
+unparseable file as an empty list. Every task route that writes the list back
+(add, edit, delete, review, the filing record) reads through
+`store.read_tasks_for_update` instead: a present file that does not parse as a task
+document is moved to `tasks.json.corrupt-<utc>` with a warning before the save, and
+a read or move that fails answers `500 tasks_unreadable` and leaves the file as it
+is. One edit therefore never saves a single task over the tasks still in the file.
 
 `ensure_data_dirs()` creates the subtree and seeds `dictionary.toml` +
 `config.json` at app startup (an `on_startup` hook, run on the executor). It
@@ -504,7 +513,7 @@ meeting view is a separate UI decision.
 
 `notes/<id>/note.md` per meeting, with pasted screenshots beside it under
 `images/` (see **Data** for why that tree, and why it is write-fenced rather than
-read-fenced). Five decisions worth carrying forward:
+read-fenced). Six decisions worth carrying forward:
 
 * **The note is not redacted**, unlike everything else this app accepts, and the PUT
   body is validated by hand rather than with `field_str`. That helper treats a
@@ -528,6 +537,18 @@ read-fenced). Five decisions worth carrying forward:
   and an image whose markdown would cross the cap is left out with the too-large
   notice. The client copy lives in `noteText.ts`; `test_meetings_note.py` holds it
   equal to the server's.
+* **One meeting view's saves land in send order**. The `pagehide` save
+  skips the mutation's queue (the page is gone before a queued save is sent), so it
+  and an autosave still on the wire are two concurrent PUTs that pool threads can
+  store in either order, and the older one landing last erased the newest text
+  after the page had discarded its draft. `useMeetingSession` numbers every save at
+  SEND time with a per-view `editor` id and a rising `seq`; `_save_note` drops a
+  save older than the last one stored for that editor, inside the same transaction
+  as its write (a seq is recorded only once its write lands, so a failed write
+  supersedes nothing), and answers `superseded: true` with the note as stored, which
+  `useNoteDraft` does not take as confirmation. The map is in memory and bounded:
+  the race never spans a restart. Different editors (two tabs, a reloaded page)
+  stay last-write-wins, and a PUT with neither field is unordered, as before.
 * **The note is never polled**, and the save response seeds the cache instead of
   invalidating: the textarea is the authoritative copy, and refetching under the user
   is how an autosaving editor loses a sentence.
@@ -726,6 +747,11 @@ let the server close so trailing finals arrive. Every FINAL segment is POSTed to
 they drive both the compact caption and one clearly marked live row, then disappear
 when the recognizer finalizes or the stream closes. The browser keeps only a
 bounded recent-final buffer for the caption because the JSONL file owns history.
+A stop or an unmount while the microphone permission prompt is open ends the
+start: when the prompt is answered, the late stream is released and no socket
+opens. A pause or end during the prompt is such a stop: the hook's
+`isStarting()` reports the pending start, which `active` and `connecting` do
+not yet show, and the status binding stops it.
 
 `TranscriptPanel` is always present in a meeting and remains available during
 action-item review. With at least one enabled note or diagram agent,

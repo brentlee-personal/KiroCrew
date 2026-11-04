@@ -33,7 +33,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_REASON_TIMEOUT,
     AcpTimeoutError,
 )
-from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store
+from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store, unattended_turn
 from kiro_crew.llm_helpers_parts.backend_errors import (
     _PROMPT_BUSY_DELAY,
     _PROMPT_BUSY_RETRIES,
@@ -49,6 +49,7 @@ from kiro_crew.llm_helpers_parts.model_fallback import (
     FALLBACK_CANDIDATE_ATTEMPTS,
     FALLBACK_STORY_ATTR,
     TURN_FALLBACK_ATTR,
+    ActiveModelLine,
     FallbackState,
     advance_fallback_candidate,
     first_advertised_fallback,
@@ -117,6 +118,7 @@ async def stream_and_collect(
     session_key: str = "",
     agent: str = "",
     app: str = "",
+    unattended: bool = False,
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
     allow_image: bool = True,
@@ -188,6 +190,11 @@ async def stream_and_collect(
             it can only look up a profile it has been told the name of; with all
             three empty it applies the ceiling alone. ``REJECT_ALL`` runs no
             tools. Every other policy consults the gate before an approval.
+        unattended: The turn runs with nobody watching (cron, heartbeat, a
+            monitor wake). Each gate consultation runs under
+            ``hooks.unattended_turn``, so a governance evaluation that raises
+            refuses the call instead of allowing it. ``False`` (default) keeps
+            the attended behavior.
         fallback_models: Ordered chain of model ids tried when the same-model
             transient budget exhausts on a throttle/capacity error (Case 2.75).
             Empty (the default) disables the chain — behavior is byte-for-byte
@@ -226,6 +233,11 @@ async def stream_and_collect(
     # contract, but activity from that attempt remains sticky for a later
     # transient error.
     _turn_tool_activity = False
+    # Read the served model before the restore probe below can move it: the caller
+    # built *message* on the model serving now, and every attempt re-sends it through
+    # this, so a restore, a fallback swap or a rejected-model retry is stated in the
+    # prompt's [ACTIVE MODEL] line instead of the model that served at build time.
+    _active_line = ActiveModelLine(message, provider)
     # Sticky-restore probe (§restore policy): if an earlier turn on this
     # provider fell back, try ONCE to move back to the primary before this
     # turn streams. Quiet on success (log only); a still-throttled primary
@@ -263,6 +275,7 @@ async def stream_and_collect(
         # baseline an attempt that was billed and then failed is invisible.
         attempt_stats_before = _billing_stats(provider)
         try:
+            message = _active_line.current()
             events = (
                 provider.stream(message)
                 if allow_image
@@ -285,19 +298,20 @@ async def stream_and_collect(
                     # or an unattended-approval timeout. Only the former says
                     # anything about the job itself.
                     _decision: list[tuple[str, str, str]] = []
-                    approved = await _resolve_permission(
-                        provider,
-                        event,
-                        approval_policy,
-                        hooks,
-                        on_tool_approval,
-                        session_key=session_key,
-                        agent=agent,
-                        app=app,
-                        on_decision=lambda outcome, mech, why: _decision.append(
-                            (outcome, mech, why)
-                        ),
-                    )
+                    with unattended_turn(unattended):
+                        approved = await _resolve_permission(
+                            provider,
+                            event,
+                            approval_policy,
+                            hooks,
+                            on_tool_approval,
+                            session_key=session_key,
+                            agent=agent,
+                            app=app,
+                            on_decision=lambda outcome, mech, why: _decision.append(
+                                (outcome, mech, why)
+                            ),
+                        )
                     if on_tool_gate:
                         _mech, _why = _decision[-1][1:] if _decision else ("", "")
                         gate_this_attempt.append(
