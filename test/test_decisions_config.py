@@ -83,7 +83,7 @@ class TestDefaults:
             if is_dataclass(getattr(config, f.name))
         }
         assert nested == {
-            "provider": {"endpoint", "api_key", "model", "timeout_ms"},
+            "provider": {"endpoint", "api_key", "model", "timeout_ms", "gpu"},
             "nudge_wake": {"provider", "llm_model", "quiet_streak_floor"},
         }
 
@@ -92,6 +92,12 @@ class TestDefaults:
         assert provider.endpoint == DECISION_PROVIDER_ENDPOINT_DEFAULT
         assert provider.model == "jev-latest"
         assert provider.timeout_ms == 1000
+        assert provider.gpu is False
+
+    def test_only_a_boolean_true_turns_the_gpu_switch_on(self):
+        assert DecisionsConfig.from_raw({"provider": {"gpu": True}}).provider.gpu is True
+        for raw in (False, None, "true", 1, "yes"):
+            assert DecisionsConfig.from_raw({"provider": {"gpu": raw}}).provider.gpu is False
 
     def test_the_api_key_field_is_schema_sensitive(self):
         """What makes the masked GET cover it; pinned so a rewrite cannot drop it."""
@@ -328,9 +334,12 @@ class TestProvider:
 
     def test_a_hand_edited_section_never_stops_the_load(self):
         """The parse normalizes; it does not reject, so a typo cannot block boot."""
-        DecisionsConfig.from_raw(
+        parsed = DecisionsConfig.from_raw(
             {"enabled": "maybe", "bucket": "most", "provider": {"timeout_ms": "quick"}}
         )
+        # A malformed bucket fails closed to nobody; an unreadable timeout is the default.
+        assert parsed.bucket == 0
+        assert parsed.provider.timeout_ms == DecisionProviderConfig.timeout_ms
 
 
 class TestTheLoaderWiresTheSection:

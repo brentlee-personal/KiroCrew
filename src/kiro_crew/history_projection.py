@@ -30,7 +30,11 @@ from kiro_crew import owner_only_files, platform_compat
 
 # ``replace_with_retry`` is facade surface with no reader here: its inventory,
 # test/campaign_facade_inventories/kiro_crew.history_projection.json, pins it.
-from kiro_crew.atomic_write import atomic_write, replace_with_retry  # noqa: F401
+from kiro_crew.atomic_write import (  # noqa: F401
+    TRANSCRIPT_REPLACE_BUDGET_SECONDS,
+    atomic_write,
+    replace_with_retry,
+)
 from kiro_crew.chat_attachments import (
     purge_staged_attachments,
     restore_staged_attachments,
@@ -96,6 +100,26 @@ def _split_transcript_bytes(data: bytes) -> list[str]:
     decode strictly, as ``read_text`` always did, so a damaged ROW still raises.
     """
     return _split_transcript_head(data)[0]
+
+
+def metadata_record_for_update(metadata: dict, fields: dict, *, healing_corrupt_line: bool) -> dict:
+    """Build the exact metadata object a metadata update serializes.
+
+    Shared by the writer and by callers that must bound the line before writing it.
+    """
+    if healing_corrupt_line:
+        record = {
+            "_type": "metadata",
+            "last_consolidated": 0,
+            "memory_mode": STRICTEST_MEMORY_MODE,
+        }
+    else:
+        record = dict(metadata)
+    record.update(fields)
+    if healing_corrupt_line:
+        record["memory_mode"] = STRICTEST_MEMORY_MODE
+        record.pop("memory_store", None)
+    return record
 
 
 class SessionMetadataProjection:
@@ -499,8 +523,17 @@ class SessionMetadataProjection:
         if content is None:
             return False
         if not durable:
-            # Unsynced, owner-only on every root (see the docstring).
-            atomic_write(path, content, mode=owner_only_files.OWNER_ONLY_FILE_MODE)
+            # Unsynced, owner-only on every root (see the docstring). The rename
+            # carries the transcript budget so a held Windows reader does not
+            # defeat it inside the count-based retry's short window; off the event
+            # loop (the consolidation lease claim) the budget is spent, on the
+            # loop replace_with_retry re-raises at once and never sleeps.
+            atomic_write(
+                path,
+                content,
+                mode=owner_only_files.OWNER_ONLY_FILE_MODE,
+                replace_budget_s=TRANSCRIPT_REPLACE_BUDGET_SECONDS,
+            )
             _history_facade()._restore_mtime(path, previous_mtime)
             self._log._invalidate_cache(key)
             return True
@@ -536,15 +569,12 @@ class SessionMetadataProjection:
                     STRICTEST_MEMORY_MODE,
                 )
                 healing_corrupt_line = True
-                metadata = {
-                    "_type": "metadata",
-                    "last_consolidated": 0,
-                    "memory_mode": STRICTEST_MEMORY_MODE,
-                }
-            if not isinstance(metadata, dict):
-                return None
-            if metadata.get("_type") != "metadata":
-                return None
+                metadata = {}
+            if not healing_corrupt_line:
+                if not isinstance(metadata, dict):
+                    return None
+                if metadata.get("_type") != "metadata":
+                    return None
         else:
             self._log._dir.mkdir(parents=True, exist_ok=True)
             metadata = {
@@ -554,10 +584,9 @@ class SessionMetadataProjection:
             }
             lines = [""]
 
-        metadata.update(fields)
-        if healing_corrupt_line:
-            metadata["memory_mode"] = STRICTEST_MEMORY_MODE
-            metadata.pop("memory_store", None)
+        metadata = metadata_record_for_update(
+            metadata, fields, healing_corrupt_line=healing_corrupt_line
+        )
         lines[0] = json.dumps(metadata) + "\n"
         return "".join(lines).encode("utf-8")
 
@@ -573,8 +602,16 @@ class SessionMetadataProjection:
         key: str,
         *,
         only_if_closed_before: float | None = None,
+        only_if_closed_id: str | None = None,
     ) -> None:
-        """Remove a stale closed marker with an optional compare-and-clear."""
+        """Remove a stale closed marker with an optional compare-and-clear.
+
+        *only_if_closed_before* keeps a stamp whose ``closed_at`` is at or past
+        the bound. *only_if_closed_id* keeps every stamp whose ``closed_id``
+        differs from the given identity -- a line stamped without one included,
+        so a writer can clear only the stamp it wrote itself. Both are read
+        under the transcript lock, against the line as it is now.
+        """
         with self._log._locked(key):
             path = self._log._path(key)
             if not path.exists():
@@ -601,8 +638,11 @@ class SessionMetadataProjection:
                     close_time = previous_mtime
                 if close_time is not None and close_time >= only_if_closed_before:
                     return
+            if only_if_closed_id is not None and metadata.get("closed_id") != only_if_closed_id:
+                return
             metadata.pop("closed", None)
             metadata.pop("closed_at", None)
+            metadata.pop("closed_id", None)
             lines[0] = json.dumps(metadata) + "\n"
             # Synced: the replacement carries every row, not just the cleared flag.
             # Bytes, so no newline translation turns the LF ends into CRLF on Windows.

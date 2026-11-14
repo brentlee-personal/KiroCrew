@@ -77,7 +77,8 @@ class KasToken:
     ``provider`` is the governance classification KAS keys off — one of
     ``BuilderId`` / ``Google`` / ``Github`` / ``Enterprise`` / ``ExternalIdp`` /
     ``Internal``. ``profile_arn`` is mandatory for enterprise/IdC identities and feeds
-    the ``X-Kiro-Profile-Arn`` header; social/Builder ID may omit it.
+    the ``X-Kiro-Profile-Arn`` header. Builder ID stores none (it has no profile to
+    look up); the engine is given a fixed one, :func:`kiro_crew.auth.provider.kas_profile_arn`.
     """
 
     access_token: str
@@ -91,6 +92,7 @@ class KasToken:
     # IdC refresh needs the dynamically-registered client credentials.
     client_id: str | None = None
     client_secret: str | None = None
+    client_secret_expires_at: int | None = None  # RegisterClient's, epoch seconds
     token_endpoint: str | None = None  # external_idp refresh
     extra: dict = field(default_factory=dict)
 
@@ -474,7 +476,7 @@ class TokenStore:
     def refresh_rejected_strict(self, identity: str) -> datetime | None:
         """Like :meth:`refresh_rejected`, but a marker it cannot read RAISES.
 
-        For a fail-closed reader (the enterprise gate): only a marker that is not
+        For a fail-closed reader (the LTS gate): only a marker that is not
         there is "not refused". A marker that exists but cannot be parsed still
         records a refusal, so it answers now.
         """

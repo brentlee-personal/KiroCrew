@@ -897,22 +897,22 @@ const MemoriesSection: React.FC<{
 
   // Walk steps
   if (shouldShowStat(stats.walkSteps)) {
-    rows.push({ Icon: PawPrint, text: i18nT('apps.mochi.stats.walks', { count: fmtNumber(stats.walkSteps) }) })
+    rows.push({ Icon: PawPrint, text: i18nT('apps.mochi.stats.walks', { count: stats.walkSteps, n: fmtNumber(stats.walkSteps) }) })
   }
 
   // Screenshots
   if (shouldShowStat(stats.screenshots)) {
-    rows.push({ Icon: Camera, text: i18nT('apps.mochi.stats.screenshots', { count: fmtNumber(stats.screenshots) }) })
+    rows.push({ Icon: Camera, text: i18nT('apps.mochi.stats.screenshots', { count: stats.screenshots, n: fmtNumber(stats.screenshots) }) })
   }
 
   // Peeks
   if (shouldShowStat(stats.peeks)) {
-    rows.push({ Icon: EyeOff, text: i18nT('apps.mochi.stats.peeks', { count: fmtNumber(stats.peeks) }) })
+    rows.push({ Icon: EyeOff, text: i18nT('apps.mochi.stats.peeks', { count: stats.peeks, n: fmtNumber(stats.peeks) }) })
   }
 
   // Drags
   if (shouldShowStat(stats.drags)) {
-    rows.push({ Icon: MousePointer, text: i18nT('apps.mochi.stats.drags', { count: fmtNumber(stats.drags) }) })
+    rows.push({ Icon: MousePointer, text: i18nT('apps.mochi.stats.drags', { count: stats.drags, n: fmtNumber(stats.drags) }) })
   }
 
   // Thinking time
@@ -936,14 +936,15 @@ const MemoriesSection: React.FC<{
       Icon: Flame,
       text: i18nT('apps.mochi.stats.busiest_day', {
         date: formatDate(stats.busiestDay.date),
-        count: fmtNumber(stats.busiestDay.messages),
+        count: stats.busiestDay.messages,
+        n: fmtNumber(stats.busiestDay.messages),
       }),
     })
   }
 
   // Longest chat
   if (shouldShowStat(stats.longestChat)) {
-    rows.push({ Icon: MessageCircle, text: i18nT('apps.mochi.stats.longest_chat', { count: fmtNumber(stats.longestChat) }) })
+    rows.push({ Icon: MessageCircle, text: i18nT('apps.mochi.stats.longest_chat', { count: stats.longestChat, n: fmtNumber(stats.longestChat) }) })
   }
 
   // First-use: show a warm welcome if almost no data yet
@@ -1051,7 +1052,9 @@ const MiniToggle: React.FC<{ on: boolean; onChange: (v: boolean) => void; label:
   </div>
 )
 
-const McpSection: React.FC<{
+// Exported for testing: the Refresh tools button lives here, and reaching it
+// through the whole SettingsPanel would need the full config/rail setup.
+export const McpSection: React.FC<{
   config: AppConfig
   editMochi: (partial: Partial<AppConfig['mochi']>) => void
   trustMode: 'normal' | 'trust_reads' | 'trust' | 'yolo'
@@ -1214,8 +1217,16 @@ const McpSection: React.FC<{
         <TabsContent value={tab} style={{ outline: 'none' }}>
         {/* Refresh tools */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-          <button onClick={() => refreshTools(s.name)} disabled={refreshing === s.name} style={{
-            fontSize: 10, padding: '3px 8px', borderRadius: 4, cursor: 'pointer',
+          <button onClick={() => { if (refreshing !== s.name) refreshTools(s.name) }}
+            // `aria-disabled` + the click guard, NOT `disabled`: a native
+            // `disabled` takes the button out of the tab order, so a keyboard
+            // user who pressed Refresh lost focus to the window until the
+            // discovery finished. The inline `opacity` keeps the muted look
+            // (utility classes do not resolve in this settings window).
+            aria-disabled={refreshing === s.name || undefined}
+            aria-busy={refreshing === s.name || undefined}
+            style={{
+            fontSize: 10, padding: '3px 8px', borderRadius: 4, cursor: refreshing === s.name ? 'default' : 'pointer',
             background: 'var(--bg)', border: '1px solid var(--border)', color: 'var(--text)',
             opacity: refreshing === s.name ? 0.5 : 1,
           }}>{refreshing === s.name ? i18nT('apps.mochi.settingsPanel.mcp_refreshing') : i18nT('apps.mochi.settingsPanel.mcp_refresh_tools')}</button>

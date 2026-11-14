@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Trans } from 'react-i18next'
@@ -70,6 +70,9 @@ type Candidate = {
    *  snooze/skip records, and a fold there would make dismissing `0.4.0`
    *  swallow the next release's `0.4.0rcN` candidate too. */
   displayVersion: string
+  /** Gateway only: the candidate IS the running version (a git checkout
+   *  that is only behind its upstream), so the text names no version. */
+  sameAsRunning?: boolean
   notes?: string
   /** Gateway only: which action the primary slot offers. */
   affordance?: 'apply' | 'arm' | 'command'
@@ -95,6 +98,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
   // Backend-folded sibling for DISPLAY (clean base on the stable channel).
   // Raw fallback below covers a gateway that predates the field.
   const gwVersionDisplay = useAppSelector(s => s.dashboard.status?.update_latest_version_display) || ''
+  const runningVersion = useAppSelector(s => s.dashboard.status?.version) || ''
   const gwCanApply = useAppSelector(s => s.dashboard.status?.update_can_apply)
   const gwCanArm = useAppSelector(s => s.dashboard.status?.update_can_arm)
   const gwCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
@@ -167,6 +171,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
       candidate = {
         source: 'gateway', version: gwVersion,
         displayVersion: gwVersionDisplay || gwVersion,
+        sameAsRunning: gwVersion === runningVersion,
         affordance: afford, command: gwCommand,
       }
     }
@@ -335,7 +340,9 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
   const dismiss = () => { if (candidate && !required) verdict(snoozeRecord(candidate.version, Date.now() / 1000)) }
   const skip = () => { if (candidate && !required) verdict(skipRecord(candidate.version)) }
 
-  useEffect(() => {
+  // A layout effect, so Escape is armed in the commit that shows the modal: a
+  // passive effect can run a task later and miss a press made in between.
+  useLayoutEffect(() => {
     if (!open || required) return
     const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') dismiss() }
     window.addEventListener('keydown', handler)
@@ -440,7 +447,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
     // is not the reference: it portals to a separate stacking context, while a
     // z-[100] here would tie a DOM-earlier takeover and win on document order.
     <div
-      className="fixed inset-0 z-[65] bg-bg/80 backdrop-blur-xs flex items-center justify-center animate-rise"
+      className="fixed inset-0 z-[65] bg-bg/80 backdrop-blur-xs flex items-center justify-center animate-rise p-safe"
       role="presentation"
       onClick={e => { if (e.target === e.currentTarget && !required) dismiss() }}
     >
@@ -479,11 +486,15 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
                 ASCII joiner spaces cannot express. The bold wrapper is the
                 NUMBERED tag <0> because the catalog integrity gate forbids
                 letter-named closing tags in values. */}
-            <Trans
-              i18nKey="components.updateFoundModal.version_is_available"
-              values={{ version: candidate.displayVersion }}
-              components={[<span key="v" className="font-semibold" />]}
-            />
+            {candidate.sameAsRunning
+              ? i18nT('pages.settings.aboutPanel.a_newer_version_is_available')
+              : (
+                <Trans
+                  i18nKey="components.updateFoundModal.version_is_available"
+                  values={{ version: candidate.displayVersion }}
+                  components={[<span key="v" className="font-semibold" />]}
+                />
+              )}
           </p>
           {required && (
             // Why the modal cannot be dismissed. `update_min_version` is

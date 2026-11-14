@@ -1,8 +1,8 @@
 """The typed ``app.json`` blocks other than ``contributes``.
 
 One dataclass per block -- ``crons``, ``ui``, ``backend`` and its ``hooks``,
-``permissions``, ``setup``, ``dependencies``, ``platform``, ``publishProvider`` and
-``notifications`` -- each with the ``from_dict`` / ``to_dict`` pair ``AppManifest``
+``permissions``, ``setup``, ``dependencies``, ``platform``, ``publishProvider``,
+``notifications`` and ``l10n`` -- each with the ``from_dict`` / ``to_dict`` pair ``AppManifest``
 composes and, where a block has rules of its own, a ``validate``. Parsing is defensive by
 contract: a wrong JSON type degrades to the field's empty value, and a value that would
 silently change meaning is recorded so validation can refuse it.
@@ -340,8 +340,17 @@ class UISidebar:
     def from_dict(cls, data: dict[str, Any]) -> UISidebar:
         return cls(
             section=str(data.get("section", "Apps")),
-            order=int(data.get("order", 10)),
+            order=_sidebar_order(data.get("order", 10)),
         )
+
+
+def _sidebar_order(raw: Any) -> int:
+    """``ui.sidebar.order`` as an int; a value int() cannot take (``null``, ``"top"``,
+    NaN) keeps the default 10 instead of failing the whole manifest."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 10
 
 
 @dataclass
@@ -559,6 +568,13 @@ class Permissions:
     #: May send turns, choose response options, approve or deny pending tool
     #: requests, and change approval modes for user-owned sessions.
     sessionApproval: bool = False  # noqa: N815
+    #: Widens ``sessionApproval`` to a member's pinned DM thread (the live
+    #: ``member-*`` slot the owner opened): the same four actions, nothing else
+    #: about the Bot. Grants nothing without ``sessionApproval``, and a
+    #: manifest that newly declares it re-opens that grant's consent. Declared
+    #: rather than implied so "which apps can speak to my Bots" is
+    #: answerable from the manifest.
+    memberThreads: bool = False  # noqa: N815
     #: May spawn a background agent through the host's subagent manager.
     #: Declared rather than implicit so "which apps can start an agent" is
     #: auditable from the manifest instead of from an app's import graph.
@@ -571,6 +587,15 @@ class Permissions:
     #: May raise a ``crewmate.import`` owner card through ``ctx.crewmate``. The
     #: card creates nothing until the owner presses it.
     proposeCrewmate: bool = False  # noqa: N815
+    #: May run turns of agents on sessions under its own key prefix through
+    #: ``ctx.turns``: tool-gated under this app's identity, admitted as Crew
+    #: automation. Declared for the same reason as ``spawn``.
+    agentTurns: bool = False  # noqa: N815
+    #: May hold a bounded, audited auto-approve grant on the app's OWN worker
+    #: slots through ``ctx.auto_approve`` (``apps/worker_auto_approve.py``).
+    #: Shown at the trust prompt and held back on a widening update like a new
+    #: API path; never above the approval ceiling.
+    workerAutoApprove: bool = False  # noqa: N815
     # WS cross-app visibility opt-in: app names (or ["*"]) allowed to use
     # slots:app:<this-app> / subagent:app:<this-app> declarations to observe
     # this app's slots and subagents. Empty list = no cross-app visibility.
@@ -594,12 +619,18 @@ class Permissions:
             d["cron"] = True
         if self.sessionApproval:
             d["sessionApproval"] = True
+        if self.memberThreads:
+            d["memberThreads"] = True
         if self.spawn:
             d["spawn"] = True
         if self.jobs:
             d["jobs"] = True
         if self.proposeCrewmate:
             d["proposeCrewmate"] = True
+        if self.agentTurns:
+            d["agentTurns"] = True
+        if self.workerAutoApprove:
+            d["workerAutoApprove"] = True
         if self.exposeToApps:
             d["exposeToApps"] = self.exposeToApps
         return d
@@ -626,9 +657,12 @@ class Permissions:
             memory=str(data.get("memory", "")),
             cron=data.get("cron") is True,
             sessionApproval=data.get("sessionApproval") is True,  # noqa: N815
+            memberThreads=data.get("memberThreads") is True,  # noqa: N815
             spawn=data.get("spawn") is True,
             jobs=data.get("jobs") is True,
             proposeCrewmate=data.get("proposeCrewmate") is True,  # noqa: N815
+            agentTurns=data.get("agentTurns") is True,  # noqa: N815
+            workerAutoApprove=data.get("workerAutoApprove") is True,  # noqa: N815
             exposeToApps=_granted_list(data.get("exposeToApps")),  # noqa: N815
         )
 
@@ -724,10 +758,11 @@ class SetupConfig:
     onInstall: str = ""  # shell command, registry install + every registry update  # noqa: N815
     # `onUpdate` is declared and round-trips but NOTHING dispatches it (see the
     # declared-not-wired paragraph in docs/system-specs/modules/app-kit-platform.md
-    # and test/test_setup_hooks_contract.py). Put update-time work in `onInstall`.
+    # and test/test_setup_hooks_contract.py). Put update-time work in `onEnable`,
+    # which an update of an enabled app re-runs, or in `onInstall`.
     onUpdate: str = ""  # declared, not executed: no code path dispatches it  # noqa: N815
     onUninstall: str = ""  # shell command run before removing app files  # noqa: N815
-    onEnable: str = ""  # shell command run when app is enabled  # noqa: N815
+    onEnable: str = ""  # run on enable, and after an enabled app's update  # noqa: N815
     onDisable: str = ""  # shell command run when app is disabled  # noqa: N815
     # onEnable / onDisable / onUninstall run through `/bin/bash` and are NOT run
     # on native Windows (no `/bin/bash`): the runner refuses them with an
@@ -1226,3 +1261,135 @@ class NotificationsConfig:
                     f"one of {_CHANNEL_PRIORITIES}, got {ch.defaultPriority!r}"
                 )
         return errors
+
+
+#: A locale key: a 2-3 letter language, optionally one region or script subtag
+#: (``de``, ``pt-BR``, ``zh-CN``). The dashboard looks a locale up by exactly this key
+#: and then by its base language, so a key outside the grammar could never be read.
+L10N_LOCALE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$")
+MAX_L10N_LOCALES = 32
+MAX_L10N_HIGHLIGHTS = 12
+MAX_L10N_HIGHLIGHT_CHARS = 300
+#: The string fields an ``l10n`` entry may carry, each with its length cap.
+L10N_TEXT_CAPS: dict[str, int] = {"displayName": 120, "description": 1000, "pageLabel": 60}
+#: Drop warnings kept per block; the drops past it are counted in one summary line.
+MAX_L10N_WARNINGS = MAX_L10N_LOCALES
+#: Longest app-supplied key quoted in a drop warning, and how many unknown keys it names.
+_L10N_QUOTED_CHARS = 40
+_L10N_QUOTED_KEYS = 3
+
+
+def _l10n_quoted(text: str) -> str:
+    """*text* cut to :data:`_L10N_QUOTED_CHARS`: app-supplied keys are quoted in warnings."""
+    return text if len(text) <= _L10N_QUOTED_CHARS else text[: _L10N_QUOTED_CHARS - 3] + "..."
+
+
+@dataclass
+class L10nEntry:
+    """One locale's translation of an app's listing copy. Every field is optional."""
+
+    displayName: str = ""  # noqa: N815
+    description: str = ""
+    pageLabel: str = ""  # noqa: N815
+    highlights: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        if self.displayName:
+            d["displayName"] = self.displayName
+        if self.description:
+            d["description"] = self.description
+        if self.pageLabel:
+            d["pageLabel"] = self.pageLabel
+        if self.highlights:
+            d["highlights"] = list(self.highlights)
+        return d
+
+    @classmethod
+    def parse(cls, raw: Any) -> tuple[L10nEntry | None, str]:
+        """``(entry, "")`` for a well-formed object, else ``(None, reason)``."""
+        if not isinstance(raw, dict):
+            return None, "must be an object"
+        unknown = sorted(str(k) for k in raw if k not in L10N_TEXT_CAPS and k != "highlights")
+        if unknown:
+            named = ", ".join(_l10n_quoted(k) for k in unknown[:_L10N_QUOTED_KEYS])
+            more = len(unknown) - _L10N_QUOTED_KEYS
+            return None, f"unknown key(s) {named}" + (f" and {more} more" if more > 0 else "")
+        values: dict[str, str] = {}
+        for key, cap in L10N_TEXT_CAPS.items():
+            value = raw.get(key, "")
+            if not isinstance(value, str):
+                return None, f"{key} must be a string"
+            if len(value) > cap:
+                return None, f"{key} is longer than {cap} characters"
+            values[key] = value
+        highlights = raw.get("highlights", [])
+        if not isinstance(highlights, list) or not all(isinstance(h, str) for h in highlights):
+            return None, "highlights must be an array of strings"
+        if len(highlights) > MAX_L10N_HIGHLIGHTS:
+            return None, f"highlights has more than {MAX_L10N_HIGHLIGHTS} items"
+        if any(len(h) > MAX_L10N_HIGHLIGHT_CHARS for h in highlights):
+            return None, f"a highlight is longer than {MAX_L10N_HIGHLIGHT_CHARS} characters"
+        return (
+            cls(
+                displayName=values["displayName"],  # noqa: N815
+                description=values["description"],
+                pageLabel=values["pageLabel"],  # noqa: N815
+                highlights=list(highlights),
+            ),
+            "",
+        )
+
+
+@dataclass
+class L10nConfig:
+    """An app's optional ``l10n`` block: listing copy per locale.
+
+    Content, not trust: the dashboard shows it in place of the English
+    ``displayName`` / ``description`` / page label / highlights for the reader's
+    locale, for an app of any origin. A malformed locale is DROPPED rather than
+    refused, so a translation mistake never blocks an install; each drop is kept
+    in ``warnings`` for the install path to report, up to :data:`MAX_L10N_WARNINGS`
+    of them plus one line counting the rest.
+    """
+
+    entries: dict[str, L10nEntry] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list, compare=False, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for locale, entry in self.entries.items():
+            body = entry.to_dict()
+            if body:
+                out[locale] = body
+        return out
+
+    @classmethod
+    def from_value(cls, raw: Any) -> L10nConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            return cls(warnings=["l10n: must be an object; ignored"])
+        entries: dict[str, L10nEntry] = {}
+        warnings: list[str] = []
+        uncounted = 0
+        for locale, value in raw.items():
+            if not isinstance(locale, str) or not L10N_LOCALE_RE.fullmatch(locale):
+                warning = (
+                    f"l10n: locale key {_l10n_quoted(repr(locale))} is not a locale tag; dropped"
+                )
+            elif len(entries) >= MAX_L10N_LOCALES:
+                warning = f"l10n: more than {MAX_L10N_LOCALES} locales; {locale!r} dropped"
+            else:
+                entry, reason = L10nEntry.parse(value)
+                if entry is not None:
+                    entries[locale] = entry
+                    continue
+                warning = f"l10n.{locale}: {reason}; dropped"
+            if len(warnings) < MAX_L10N_WARNINGS:
+                warnings.append(warning)
+            else:
+                uncounted += 1
+        if uncounted:
+            warnings.append(f"l10n: {uncounted} more locale(s) dropped")
+        return cls(entries=entries, warnings=warnings)

@@ -101,9 +101,13 @@ export function useCrewModeSwitch({ currentSlot, defaultAgent, hasUserMessage, s
     if (!rootKey || enteredKey.current === rootKey) { if (!rootKey) enteredKey.current = null; return }
     enteredKey.current = rootKey
     if (isMobile) return
+    // A chat created already in Ultra Mode (`dashboard.new_chat_crew_mode`) is
+    // entered, not turned on: remember a closed panel the same way, so turning
+    // it off before the first message closes the panel again.
+    if (!activityOpen) panelWasClosed.current.add(rootKey)
     dispatch(openActivityPanel())
     openView('workers')
-  }, [rootKey, dispatch, openView, isMobile])
+  }, [rootKey, dispatch, openView, isMobile, activityOpen])
   // The chats whose switch back to the default agent is in flight: their chips
   // come back the moment the mark is pressed, the same way they leave on turning on.
   const [turningOff, setTurningOff] = useState<ReadonlySet<string>>(EMPTY)
@@ -171,8 +175,12 @@ export function useCrewModeSwitch({ currentSlot, defaultAgent, hasUserMessage, s
       dropPanelViews(key, BOARD_VIEWS)
     }).finally(() => setTurningOff(set => withoutKey(set, key)))
   }, [crewModeCancellable, currentSlot, switchAgent, defaultAgent, dispatch])
+  // A plain ROOT chat that already has a message can still be turned into an
+  // Ultra Mode chat (one way: the gateway then locks it on the conductor). A
+  // crew member's chat is not a root, so it never offers this.
+  const crewModeMidChat = crewModeEligible && !crewModeChosen && hasUserMessage && isRootSession(currentSlot)
   return {
-    crewModeEligible, crewModeOn, crewModeChosen, crewModeLeaving, crewModeSwitching, turnOnCrewMode,
+    crewModeEligible, crewModeOn, crewModeChosen, crewModeLeaving, crewModeSwitching, turnOnCrewMode, crewModeMidChat,
     turnOffCrewMode: crewModeCancellable ? turnOffCrewMode : undefined,
     openTaskBoard: taskBoardOffered ? openTaskBoard : undefined,
   }

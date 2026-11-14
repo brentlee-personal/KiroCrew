@@ -112,7 +112,8 @@ def test_with_no_provider_the_member_selector_answers(monkeypatch):
     monkeypatch.setattr(crewmate_harness, "crewmate_backend_pin", lambda config, key: pin)
     seen: list[Any] = []
 
-    def select(sk, member, default, *, crew_backend=None):
+    def select(sk, member, default, *, backend_override=None, crew_backend=None):
+        assert backend_override is None
         seen.append(crew_backend)
         return default
 
@@ -273,17 +274,44 @@ def test_a_rebuild_counts_only_when_every_spec_was_written(monkeypatch):
     assert tsr._rebuild_specs() is False
     _rebuild(monkeypatch, held=True)
     assert tsr._rebuild_specs() is False
+
+
+def test_the_default_agent_s_outcome_is_read_from_its_spec(monkeypatch):
+    """A held conductor spec says nothing about the default agent: what decides
+    is whether kirocrew.json now holds the server as a card addition."""
+    _rebuild(monkeypatch, held=True)
+    monkeypatch.setattr(tsr, "_default_spec_mounts", lambda server: False)
+    assert tsr._rebuild_required("kirocrew", "fetch", present=False) is False
+    assert tsr._rebuild_required("kirocrew", "fetch", present=True) is True
+    assert tsr._rebuild_required("kirocrew-conductor", "fetch", present=False) is True
     _rebuild(monkeypatch, raises=True)
     assert tsr._rebuild_specs() is False
 
 
+def test_a_composition_refused_rebuild_is_logged_as_governance(monkeypatch, caplog):
+    from kiro_crew import agent
+    from kiro_crew.platform import PlatformCompositionError
+
+    def rebuild(*, _held_out=None):
+        raise PlatformCompositionError("companion missing")
+
+    monkeypatch.setattr(agent, "rebuild_agent_config_reporting", rebuild)
+    caplog.set_level("ERROR", logger=tsr.logger.name)
+
+    assert tsr._rebuild_specs() is False
+
+    errors = [r for r in caplog.records if r.name == tsr.logger.name and r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "(governance)" in errors[0].getMessage()
+
+
 def test_only_a_conductor_needs_its_spec_rewritten(monkeypatch):
     _rebuild(monkeypatch, wrote=False)
-    assert tsr._rebuild_required("kirocrew-conductor") is True
-    assert tsr._rebuild_required("kirocrew-ledger-conductor") is True
-    assert tsr._rebuild_required("aim-installed-agent") is False
+    assert tsr._rebuild_required("kirocrew-conductor", "files", present=True) is True
+    assert tsr._rebuild_required("kirocrew-ledger-conductor", "files", present=True) is True
+    assert tsr._rebuild_required("aim-installed-agent", "files", present=True) is False
     _rebuild(monkeypatch)
-    assert tsr._rebuild_required("kirocrew-conductor") is False
+    assert tsr._rebuild_required("kirocrew-conductor", "files", present=True) is False
 
 
 def test_a_failed_reconcile_is_logged_not_raised(monkeypatch, caplog):

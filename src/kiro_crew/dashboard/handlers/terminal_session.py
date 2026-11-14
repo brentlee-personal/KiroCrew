@@ -9,12 +9,16 @@ family that holds the name.
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
-from kiro_crew.config.loader import config_path, read_config_text
+from kiro_crew.config.loader import (  # noqa: F401 - read_config_text: served by the terminal facade
+    config_local_path,
+    config_path,
+    read_config_text,
+    read_merged_config_files,
+)
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -178,12 +182,8 @@ def _read_terminal_config() -> dict:
     nested reads already follow: a malformed value means "nothing configured",
     which is also what an absent key means.
     """
-    try:
-        data = json.loads(read_config_text(config_path()))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
+    # config.local.json is an overlay whose keys win, as the loader merges it.
+    data = read_merged_config_files(config_path(), config_local_path())
     dashboard = data.get("dashboard")
     if not isinstance(dashboard, dict):
         return {}
@@ -199,10 +199,15 @@ def _is_enabled(request: web.Request) -> bool:
     now = time.monotonic()
     if now - _enabled_cache[1] < 30:
         return _enabled_cache[0]
-    result = bool(_get_config(request).get("enabled", True))
+    result = _terminal_enabled(_get_config(request))
     _enabled_cache[0] = result
     _enabled_cache[1] = now
     return result
+
+
+def _terminal_enabled(cfg: dict) -> bool:
+    """Whether a ``dashboard.terminal`` object leaves the panel on (the default)."""
+    return bool(cfg.get("enabled", True))
 
 
 _enabled_cache: list = [True, 0.0]  # [value, timestamp]

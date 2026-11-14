@@ -62,12 +62,14 @@ class ProcessStartIdentity(NamedTuple):
 # with six uint64 fields — ``pti_virtual_size``, ``pti_resident_size``,
 # ``pti_total_user``, ``pti_total_system``, ``pti_threads_user``,
 # ``pti_threads_system`` (48 bytes) — followed by twelve int32 counters (48),
-# for a struct size of 96. Only the two total-CPU fields matter here; the total
-# size doubles as the layout check. Both are in MACH TICKS, not nanoseconds: the
-# two coincide on Intel (1 GHz timebase), but on Apple Silicon one tick is 125/3
-# ns (24 MHz), so the reader scales them by ``hw.tbfrequency``.
+# for a struct size of 96. The readers use ``pti_resident_size`` (bytes) and the
+# two total-CPU fields; the total size doubles as the layout check. The CPU
+# fields are in MACH TICKS, not nanoseconds: the two coincide on Intel (1 GHz
+# timebase), but on Apple Silicon one tick is 125/3 ns (24 MHz), so the reader
+# scales them by ``hw.tbfrequency``.
 _DARWIN_PROC_PIDTASKINFO = 4
 _DARWIN_PROC_TASKINFO_SIZE = 96
+_DARWIN_PTI_RESIDENT_SIZE_OFFSET = 8
 _DARWIN_PTI_TOTAL_USER_OFFSET = 16
 _DARWIN_PTI_TOTAL_SYSTEM_OFFSET = 24
 
@@ -81,6 +83,13 @@ _DARWIN_PTI_TOTAL_SYSTEM_OFFSET = 24
 _DARWIN_RUSAGE_INFO_V2 = 2
 _DARWIN_RUSAGE_INFO_V2_SIZE = 16 + 18 * 8
 _DARWIN_RI_PHYS_FOOTPRINT_OFFSET = 16 + 7 * 8
+# ``ri_pageins`` is the fifth uint64 in ``rusage_info_v2`` (user time, system
+# time, the two wakeup counters, then pageins), so 16 bytes of ``ri_uuid`` plus
+# four uint64 fields. It counts the disk pageins this process has taken since it
+# started -- a monotonic process-wide counter, NOT per-thread, and it does NOT
+# include compressor decompressions (macOS serves most memory pressure from the
+# compressor, so this can stay flat while the process stalls paging).
+_DARWIN_RI_PAGEINS_OFFSET = 16 + 4 * 8
 
 _darwin_libproc: Any = None
 _darwin_libproc_loaded = False
@@ -230,6 +239,44 @@ def proc_phys_footprint_bytes_for_pid(pid: int) -> int | None:
     return _darwin_process_phys_footprint_bytes(pid)
 
 
+def _darwin_process_pageins(pid: int) -> int | None:
+    """macOS ``ri_pageins`` of *pid* via ``proc_pid_rusage``, or None when unreadable.
+
+    The count of disk pageins the process has taken since it started: a
+    monotonic, process-wide counter. It is NOT per-thread, and it does NOT
+    count compressor decompressions, so under memory pressure served entirely
+    from the compressor it can stay flat while the process stalls paging.
+    Needs no entitlement for a same-uid process and never spawns a subprocess.
+    """
+    lib = _darwin_libproc_handle()
+    rusage = getattr(lib, "proc_pid_rusage", None) if lib is not None else None
+    if rusage is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_RUSAGE_INFO_V2_SIZE)
+        if rusage(pid, _DARWIN_RUSAGE_INFO_V2, buf) != 0:
+            return None
+        off = _DARWIN_RI_PAGEINS_OFFSET
+        # Both x86_64 and arm64 macOS are little-endian.
+        return int.from_bytes(buf.raw[off : off + 8], "little")
+    except Exception:
+        return None
+
+
+def proc_pageins_for_pid(pid: int) -> int | None:
+    """``ri_pageins`` of *pid* on macOS; None elsewhere or unreadable.
+
+    The process-wide disk page-in count (see ``_darwin_process_pageins``). Other
+    platforms have no equivalent and answer None. A rise between two readings of
+    one silence is the macOS analogue of the Linux loop-stall watchdog's
+    per-thread major-fault delta -- coarser, because it is process-wide, which
+    is why the deferral it feeds uses a shorter grace cap.
+    """
+    if not IS_MACOS:
+        return None
+    return _darwin_process_pageins(pid)
+
+
 def darwin_libproc_available() -> bool:
     """True when ``libproc`` loads, so the macOS memory and tree probes can answer."""
     return _darwin_libproc_handle() is not None
@@ -347,6 +394,39 @@ def _darwin_process_cpu_nanos(pid: int) -> int | None:
             "little",
         )
         return (user + system) * 1_000_000_000 // frequency
+    except Exception:
+        return None
+
+
+def darwin_resident_bytes_for_pid(pid: int) -> int | None:
+    """macOS resident set size of *pid* in bytes; None elsewhere or unreadable.
+
+    Reads ``pti_resident_size`` from ``proc_pidinfo(PROC_PIDTASKINFO)``: the
+    figure ``ps -o rss=`` prints, in bytes rather than KiB. Same contract as
+    the CPU probe above: no entitlement for a same-uid process, nothing is
+    exec'd, and a fill size other than the exact struct size is refused. It
+    needs no ``ps``, which is setuid and cannot run when a sandbox strips the
+    elevation.
+    """
+    if not IS_MACOS:
+        return None
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PROC_TASKINFO_SIZE)
+        filled = lib.proc_pidinfo(
+            pid,
+            _DARWIN_PROC_PIDTASKINFO,
+            0,
+            buf,
+            _DARWIN_PROC_TASKINFO_SIZE,
+        )
+        if filled != _DARWIN_PROC_TASKINFO_SIZE:
+            return None
+        off = _DARWIN_PTI_RESIDENT_SIZE_OFFSET
+        # Both x86_64 and arm64 macOS are little-endian.
+        return int.from_bytes(buf.raw[off : off + 8], "little")
     except Exception:
         return None
 
@@ -1386,8 +1466,21 @@ def read_proc_status_int(pid: int, label: str, *, proc_root: "Path | None" = Non
     return None
 
 
-def proc_child_map(*, proc_root: "Path | None" = None) -> "dict[int, list[int]] | None":
+def proc_child_map(
+    *, proc_root: "Path | None" = None, session_members: bool = False
+) -> "dict[int, list[int]] | None":
     """Every live process's children, from ONE pass over ``/proc``. Linux only.
+
+    ``session_members=True`` also lists every process under the leader of its
+    session (``stat`` field 6) when that leader is not already its parent. It is
+    for MEASURING a runtime started with ``start_new_session``: a job left behind
+    by a timed-out shell command is reparented to init and drops out of the
+    parent walk, but keeps the runtime's session id. The edge is sound
+    because a process can only enter a session by inheriting it from a process
+    already in it (``setsid`` makes a NEW session, never joins one), so every
+    member descends from the leader, and the kernel does not reuse the leader's
+    pid while the session has members. It is never set on a path that signals
+    anything: those walk real parent edges only.
 
     For the caller that needs the subtrees of MANY roots at once. Asking the
     kernel per root (:func:`_proc_children`) costs one read per THREAD of every
@@ -1456,9 +1549,16 @@ def proc_child_map(*, proc_root: "Path | None" = None) -> "dict[int, list[int]] 
         except OSError:
             # Exited between the listing and the open: it is in no live tree.
             continue
-        ppid = _parse_ppid(raw)
+        tokens = _stat_tokens(raw)
+        ppid = _stat_token_int(tokens, 1)
         if ppid is not None:
             children.setdefault(ppid, []).append(int(name))
+        if session_members:
+            pid = int(name)
+            sid = _stat_token_int(tokens, 3)
+            # sid 0 is a kernel thread; a leader is not its own member.
+            if sid and sid != pid and sid != ppid:
+                children.setdefault(sid, []).append(pid)
     return children
 
 

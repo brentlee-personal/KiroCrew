@@ -120,6 +120,37 @@ def test_cli_sh_failed_engine_download_warns_with_the_retry_command(
     assert f"Retry when online: {launcher} kas install" in result.stderr
 
 
+def test_cli_sh_interrupted_engine_download_stops_the_install(
+    tmp_path: Path, signing_key: SigningKey
+) -> None:
+    """A `kas install` killed by Ctrl-C exits 130 (faked here): the installer
+    stops there with that status instead of warning and printing its banner."""
+    result, calls, _launcher = _run_cli_sh(
+        tmp_path / "case", signing_key, extra_env={"FAKE_KIROCREW_EXIT": "130"}
+    )
+
+    assert result.returncode == 130, result.stderr
+    assert calls == ["kas install"], calls
+    assert "could not download" not in result.stderr
+    assert "Next steps:" not in result.stdout
+
+
+def test_cli_sh_host_that_cannot_run_the_engine_gets_no_retry_advice(
+    tmp_path: Path, signing_key: SigningKey
+) -> None:
+    """Exit 3 is `kas install`'s "this host cannot run the engine" (old glibc):
+    a retry cannot help, so none is suggested."""
+    result, calls, _launcher = _run_cli_sh(
+        tmp_path / "case", signing_key, extra_env={"FAKE_KIROCREW_EXIT": "3"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls == ["kas install"], calls
+    assert "this host cannot run the built-in KAS engine" in result.stderr
+    assert "Retry when online" not in result.stderr
+    assert "could not download" not in result.stderr
+
+
 def test_cli_sh_help_names_the_opt_out() -> None:
     if os.name == "nt":
         pytest.skip("cli.sh is supported on macOS and Linux only")
@@ -129,10 +160,7 @@ def test_cli_sh_help_names_the_opt_out() -> None:
     assert "--no-kas" in result.stdout
 
 
-# ---------------------------------------------------------------------------
-# install.sh: a full run builds the clone (npm, vite, pip), so these pin the
-# script's own text instead.
-# ---------------------------------------------------------------------------
+# install.sh: a full run builds the clone (npm, vite, pip), so these pin its text.
 
 
 def _install_sh() -> str:
@@ -151,11 +179,16 @@ def test_install_sh_downloads_the_engine_by_default() -> None:
 
 def test_install_sh_failed_engine_download_only_warns() -> None:
     text = _install_sh()
-    block = text[text.index('if "$_kirocrew" kas install; then') :]
-    block = block[: block.index("\n    fi\n")]
+    block = text[text.index('"$_kirocrew" kas install || _kas_rc=$?') :]
+    block = block[: block.index("\n        fi\n")]
 
     assert "exit" not in block, "a failed engine download must not fail the install"
     assert 'detail "Retry when online: kirocrew kas install"' in block
+    # Exit 3 (the host cannot run the engine) gets no retry advice.
+    unsupported = block[block.index('"$_kas_rc" -eq 3') :]
+    unsupported = unsupported[: unsupported.index("else")]
+    assert "Retry" not in unsupported
+    assert "KAS_HOST_UNSUPPORTED=1" in unsupported
 
 
 def test_install_sh_never_turns_the_bundle_route_on() -> None:

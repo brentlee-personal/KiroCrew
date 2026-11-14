@@ -112,14 +112,26 @@ def _security(args: argparse.Namespace) -> None:
                 for p in extra:
                     print(f"  ✗ {p}")
     elif action == "audit":
-        history_dir = config_dir() / "history"
-        findings = scan_history(history_dir)
+        sessions_dir = config_dir() / "sessions"
+        findings, rows_scanned = scan_history(sessions_dir)
         if findings:
             print(f"⚠️  {len(findings)} suspicious entries found:\n")
             for f in findings:
-                print(f"  📄 {f['file']}")
-                print(f"     {f['warning']}")
-                print(f"     {f['snippet'][:120]}…\n")
+                # A transcript row is agent-written text: one line, no live controls.
+                print(f"  📄 {safe_terminal_line(f['file'])}")
+                print(f"     {safe_terminal_line(f['warning'])}")
+                if f["snippet"]:
+                    print(f"     {safe_terminal_line(f['snippet'][:120])}…")
+                print()
+        elif not rows_scanned:
+            # Nothing was read, so there is no result to call clean.
+            if sessions_dir.is_dir() and any(sessions_dir.glob("*.jsonl")):
+                print(
+                    f"ℹ️  No session transcripts scanned: the transcripts in {sessions_dir} "
+                    "held no rows to audit."
+                )
+            else:
+                print(f"ℹ️  No session transcripts scanned: none found in {sessions_dir}.")
         else:
             print("✅ No suspicious tool usage found in recent history.")
 
@@ -441,7 +453,14 @@ def _print_policy_source() -> None:
         print(
             f"   Set {POLICY_URL_ENV}, or add a 'distribution' block to the policy, to enable it."
         )
-        print(f"   Transports available: {', '.join(registered_policy_schemes())}")
+        from kiro_crew import platform_compat
+
+        # file:// is registered everywhere but refused on Windows (no ACL read yet).
+        schemes = [
+            "file (not on Windows)" if s == "file" and not platform_compat.IS_POSIX else s
+            for s in registered_policy_schemes()
+        ]
+        print(f"   Transports available: {', '.join(schemes)}")
         return
 
     interval = posture.get("refresh_interval_seconds") or 0

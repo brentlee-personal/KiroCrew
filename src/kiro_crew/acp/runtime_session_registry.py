@@ -7,7 +7,8 @@ Each function here whose first parameter is ``self`` is an ``AcpRuntime`` method
 binds it by name, so it reads and writes the runtime's own state on the instance, and a patch
 of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_pending_init_notifications``, ``_routed_requests``,
+Instance fields written: ``_announced_children``, ``_announced_overflow``,
+``_pending_init_notifications``, ``_routed_requests``, ``_session_activity_at``,
 ``_session_cwds``, ``_session_inits_in_flight``, ``_session_queues``,
 ``_subagent_owner``, ``_subagent_roster_overflow``, ``_subagent_sessions``, ``_turn_active_sessions``.
 
@@ -119,11 +120,23 @@ def _queued_behind_note(ahead: list[tuple[str, float]]) -> str:
 _TERMINATE_TIMEOUT = 5.0
 
 
+def session_activity_at(self: AcpRuntime, session_id: str) -> float | None:
+    """Monotonic time of the last backend frame attributable to *session_id*.
+
+    Counts only frames with an owner: a session-tagged frame, or a child's
+    frame observed for the session that owns the child, even if dropped.
+    An ownerless broadcast says nothing about which tenant is working,
+    so it is not counted.
+    """
+    return self._session_activity_at.get(session_id)
+
+
 def unregister_session(self: AcpRuntime, session_id: str) -> None:
     """Unregister a session queue (called by AcpSessionHandle.destroy)."""
     self._session_queues.pop(session_id, None)
     self._session_cwds.pop(session_id, None)
     self._switched_model_record().pop(session_id, None)
+    self._session_activity_at.pop(session_id, None)
     # Clean up any pending routed requests for this session
     stale = [k for k, v in self._routed_requests.items() if v == session_id]
     for k in stale:
@@ -133,6 +146,13 @@ def unregister_session(self: AcpRuntime, session_id: str) -> None:
     # approvals (the announce set is re-learned from the next
     # subagent/list_update, which re-establishes ownership explicitly).
     self._turn_active_sessions.discard(session_id)
+    # Children announced on this session leave with it, for the same reason.
+    if self._announced_children:
+        self._announced_children = {
+            child: owner for child, owner in self._announced_children.items() if owner != session_id
+        }
+    if not self._announced_children:
+        self._announced_overflow = 0
     if self._subagent_owner == session_id:
         self._subagent_owner = None
         self._subagent_sessions = set()
@@ -162,7 +182,9 @@ def mark_turn_active(self: AcpRuntime, session_id: str, active: bool) -> None:
         self._turn_active_sessions.discard(session_id)
 
 
-async def terminate_session(self: AcpRuntime, session_id: str) -> None:
+async def terminate_session(
+    self: AcpRuntime, session_id: str, *, delete_cloud_session: bool = False
+) -> None:
     """Evict a session from kiro-cli (freeing its memory), then unregister locally.
 
     Sends the ``_kiro.dev/session/terminate`` request so the multiplexed
@@ -202,6 +224,10 @@ async def terminate_session(self: AcpRuntime, session_id: str) -> None:
     try:
         if not self._dead and self._process is not None:
             policy = self._harness.teardown
+            unclaimed = session_id in self._unclaimed_new_sessions
+            if policy.local_only and not (delete_cloud_session or unclaimed):
+                return
+            self._unconfirmed_teardowns.add(session_id)
             try:
                 if policy.notification:
                     # A verb the host does not answer. Awaiting a reply here would
@@ -215,6 +241,7 @@ async def terminate_session(self: AcpRuntime, session_id: str) -> None:
                         {"sessionId": session_id},
                         timeout=_TERMINATE_TIMEOUT,
                     )
+                    self._unconfirmed_teardowns.discard(session_id)
             except Exception:
                 logger.debug(
                     "session teardown failed for %s (runtime dead/slow); "
@@ -223,6 +250,7 @@ async def terminate_session(self: AcpRuntime, session_id: str) -> None:
                     exc_info=True,
                 )
     finally:
+        self._unclaimed_new_sessions.discard(session_id)
         self.unregister_session(session_id)
 
 
@@ -287,10 +315,12 @@ async def evict_session(self: AcpRuntime, session_id: str) -> None:
     """
     try:
         if not self._dead and self._process is not None:
+            self._unconfirmed_teardowns.add(session_id)
             try:
                 await self._send_and_await(
                     METHOD_SESSION_CLOSE, {"sessionId": session_id}, timeout=_TERMINATE_TIMEOUT
                 )
+                self._unconfirmed_teardowns.discard(session_id)
             except Exception:
                 logger.debug(
                     "session/close failed for %s (runtime dead/slow); proceeding with local unregister",

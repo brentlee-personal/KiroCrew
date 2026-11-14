@@ -118,6 +118,7 @@ class _GateMixin(ManagerComponent):
         target_member: str | None = None,
         delegation: dict[str, str] | None = None,
         backend: str | None = None,
+        failover_from: str | None = None,
         label: str = "",
         _execution_context: dict | None = None,
         _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
@@ -127,6 +128,7 @@ class _GateMixin(ManagerComponent):
         _stop_before_memory_read: bool = False,
         _memory_reading: "tuple[float, str] | None" = None,
         _depth: int | None = None,
+        _root_session_key: str | None = None,
     ) -> "SubagentInfo | PreparedSpawn | ClaimPoint | MemoryReadPoint | None":
         """Spawn a subagent for *task*.
 
@@ -266,7 +268,9 @@ class _GateMixin(ManagerComponent):
                 # admission closed during one of them. The caller is told it
                 # was refused, so the store is told the same: a row left
                 # queued would run once admission reopens.
-                self._manager._admission.taskq_fail(agent_id, closed.error)
+                self._manager._admission.taskq_fail(
+                    agent_id, closed.error, memory_mode=_memory_mode or ""
+                )
             return self._manager._announce_rejection(closed)
 
         def _refuse_row(info: SubagentInfo) -> SubagentInfo:
@@ -280,12 +284,16 @@ class _GateMixin(ManagerComponent):
             A drained run is registered as a terminal record too: its caller
             was told it was accepted, and its next ``GET /api/spawn/{id}``
             must read this failure, not a 404 for an id that is neither
-            queued nor started any more. ``spawn_async``'s caller has not been
-            answered yet, and receives this refusal as its answer."""
+            queued nor started any more -- registered once the row's settle
+            has landed (``register_refused``), since that record is the
+            refusal PUBLISHED to a status poll. ``spawn_async``'s caller has
+            not been answered yet, and receives this refusal as its answer."""
             if info.error and (_from_queue or (_store_accepted and _claimed is None)):
-                self._manager._admission.taskq_fail(agent_id, info.error)
+                self._manager._admission.taskq_fail(
+                    agent_id, info.error, memory_mode=info.memory_mode
+                )
                 if _from_queue:
-                    self._manager._agents.setdefault(info.id, info)
+                    self._manager._admission.register_refused(info)
             return self._manager._announce_rejection(info)
 
         # The mutable policy gates (cwd allowlist, governance, the parent
@@ -344,6 +352,28 @@ class _GateMixin(ManagerComponent):
             _proven_depth = 1
         _carried_depth = _depth if type(_depth) is int else 0
         _depth = max(_carried_depth, _proven_depth)
+        # The root carried by a retry, continuation or drained row, else the parent's root or key.
+        if not (isinstance(_root_session_key, str) and _root_session_key):
+            _parent_record = (
+                next(
+                    (
+                        a
+                        for a in self._manager._agents.values()
+                        if not a.done
+                        and (getattr(a, "conversation_key", "") or f"subagent:{a.id}")
+                        == parent_session_key
+                    ),
+                    self._manager._agents.get(_parent_run_id),
+                )
+                if _parent_run_id
+                else None
+            )
+            _root_session_key = parent_session_key
+            if _parent_record is not None:
+                _root_session_key = (
+                    getattr(_parent_record, "root_session_key", "")
+                    or _parent_record.parent_session_key
+                )
         # The second half of a claimed dispatch is never refused for depth: its
         # first half already was checked, and a refusal here would return the
         # claimed row to the store as claimable work the caller was told was
@@ -610,6 +640,8 @@ class _GateMixin(ManagerComponent):
             # The drain re-enters ``spawn`` from this dict alone: a run that hit
             # the concurrency gate would otherwise start on the default backend.
             "backend": backend,
+            # Same reason: a queued row would otherwise lose the hop it reports.
+            "failover_from": failover_from,
             # Same reason: a queued row would otherwise start under its task text.
             "label": label,
             "allowed_tools": allowed_tools,
@@ -649,6 +681,7 @@ class _GateMixin(ManagerComponent):
             "crew": crew,
             "_memory_mode": _memory_mode,
             "_depth": _depth,
+            "_root_session_key": _root_session_key,
             # Same rule for the asking turn: `spawn_async` re-enters from this
             # dict (prepare -> write -> re-enter), so a follow-up whose asking
             # ordinal was pinned by its watcher would otherwise be re-read from
@@ -844,7 +877,7 @@ class _GateMixin(ManagerComponent):
                 _checked[3] if _checked is not None else _validate_app_agent_ownership(agent, app)
             )
             if owner_err:
-                self._manager._admission.taskq_fail(agent_id, owner_err)
+                self._manager._admission.taskq_fail(agent_id, owner_err, memory_mode=_memory_mode)
                 info = SubagentInfo(
                     id=agent_id,
                     task=_redacted_task,
@@ -878,7 +911,7 @@ class _GateMixin(ManagerComponent):
             if err:
                 # The row was accepted; an agent name that does not resolve at
                 # dispatch is a terminal failure of THAT row, never a silent drop.
-                self._manager._admission.taskq_fail(agent_id, err)
+                self._manager._admission.taskq_fail(agent_id, err, memory_mode=_memory_mode)
                 info = SubagentInfo(
                     id=agent_id,
                     task=_redacted_task,
@@ -942,6 +975,7 @@ class _GateMixin(ManagerComponent):
             "model": model or "",
             "reasoning_effort": reasoning_effort or "",
             "backend": backend,
+            "failover_from": failover_from,
             "allowed_tools": list(allowed_tools) if allowed_tools else [],
             "bare": bare,
             "keep": keep,
@@ -1289,8 +1323,9 @@ class _GateMixin(ManagerComponent):
         if verdict == "expired":
             # Never proceeds into the pressure it waited on: ended, never
             # started, its row failed so the depth stops counting it, and
-            # registered as a terminal record so a caller that was told it was
-            # queued reads this outcome by id rather than a 404.
+            # registered as a terminal record -- once that failure has landed
+            # -- so a caller that was told it was queued reads this outcome by
+            # id rather than a 404.
             ended = SubagentInfo(
                 id=agent_id,
                 task=_redacted_task,
@@ -1302,8 +1337,10 @@ class _GateMixin(ManagerComponent):
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
             )
-            self._manager._admission.taskq_fail(agent_id, MEMORY_PRESSURE_NEVER_STARTED)
-            self._manager._agents.setdefault(agent_id, ended)
+            self._manager._admission.taskq_fail(
+                agent_id, MEMORY_PRESSURE_NEVER_STARTED, memory_mode=_memory_mode
+            )
+            self._manager._admission.register_refused(ended)
             self._manager._emit_queue_depth(parent_session_key, batch_id)
             return self._manager._announce_rejection(ended)
         if verdict == "held":
@@ -1536,6 +1573,7 @@ class _GateMixin(ManagerComponent):
             crew=crew,
             memory_mode=_memory_mode,
             depth=_depth,
+            root_session_key=_root_session_key,
             **run_fields,
         )
         info._start_price_gb = candidate_price
@@ -1543,6 +1581,7 @@ class _GateMixin(ManagerComponent):
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         info._memory_mode_ready = not bool(conversation_key)
         info._taskq_generation = taskq_generation
+        info._taskq_attempt = taskq_generation
         self._manager._agents[agent_id] = info
         # A member that waited in the queue gets the parent turn attempt its
         # ``POST /api/spawn`` named (``carry_spawn_attempt``), before the pending
@@ -1584,10 +1623,16 @@ class _GateMixin(ManagerComponent):
             except RuntimeError:
                 pass  # no running loop (sync/test context)
 
+        # A spawn's own ``approval_mode="auto"`` is a session Trust: a ``permission_mode``
+        # deny of ``trust`` refuses it, and the spawn takes the approval path below.
+        from kiro_crew.approval_mode_policy import session_mode_permitted
+
+        spawn_auto = approval_mode == "auto" and session_mode_permitted("trust")
         # Check parent session trust (approval_policy="auto") set by dashboard trust toggle.
+        from kiro_crew.subagent_manager.turn_session import approval_policy_of
+
         parent_trusted = (
-            parent_session_key
-            and self._manager._sessions.get_approval_policy(parent_session_key) == "auto"
+            parent_session_key and approval_policy_of(self._manager, parent_session_key) == "auto"
         )
 
         # Shared Crew: each run's runtime starts in its initiator's containment slice.
@@ -1596,7 +1641,7 @@ class _GateMixin(ManagerComponent):
         if self._manager._is_yolo and self._manager._is_yolo():
             self._manager._tasks[agent_id] = _start_run_task(self._manager._run(info), info)
             self._manager._log_spawned(info)
-        elif approval_mode == "auto":
+        elif spawn_auto:
             self._manager._tasks[agent_id] = _start_run_task(self._manager._run(info), info)
             self._manager._log_spawned(info)
             sel().log_tool_invocation(

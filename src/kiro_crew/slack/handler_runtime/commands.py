@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from kiro_crew.slack.handler import (
         _BANG_TO_SLASH,
+        COMPACT_ACCOUNT_CHANGED_TEXT,
         SESSIONS_INCLUDE_ENDED_ARGS,
         STOP_DECLINED_COMPACTING_TEXT,
         ConversationLog,
@@ -226,8 +227,10 @@ async def _bang_yolo(
     elif len(parts) >= 2 and parts[1].lower() == "renew":
         # renew() audits fail-closed with a synchronous SEL write; keep
         # that filesystem I/O off the event loop.
-        result = await asyncio.to_thread(safety_override().renew, "slack")
-        if result.renewed:
+        # ``gateway --approval yolo``'s grant is the dashboard's only: not Slack's to renew.
+        so = safety_override()
+        result = None if so.is_cli_launch is True else await asyncio.to_thread(so.renew, "slack")
+        if result is not None and result.renewed:
             sel().log_api_access(
                 caller=user_id,
                 operation="slack.yolo_mode",
@@ -624,9 +627,25 @@ async def _bang_link_to_dashboard(
             channel, "Use this command inside a thread to import it.", reply_ts
         )
         return ""
+    from kiro_crew.slack.code_channels.binding import AnchorHandoffRefused
     from kiro_crew.slack.interactions import _import_thread_to_slot
+    from kiro_crew.slack.interactions_options import ChannelAgentMismatchError, import_refusal
 
-    slot = await _import_thread_to_slot(slack, _dashboard_state, channel, reply_ts)
+    try:
+        slot = await _import_thread_to_slot(slack, _dashboard_state, channel, reply_ts)
+    except (ChannelAgentMismatchError, AnchorHandoffRefused) as exc:
+        notice, reason = import_refusal(exc)
+        sel().log_tool_invocation(
+            session_key="",
+            agent="kirocrew",
+            source="slack",
+            tool_name="link_to_dashboard",
+            tool_kind="command",
+            outcome="denied",
+            metadata={"user_id": user_id, "channel": channel, "reason": reason},
+        )
+        await slack.post_message(channel, notice, reply_ts)
+        return ""
     if not slot:
         sel().log_tool_invocation(
             session_key="",
@@ -886,7 +905,7 @@ async def _bang_project(
             reply_ts,
         )
         return ""
-    resolved = os.path.realpath(os.path.expanduser(raw_path))
+    resolved = await asyncio.to_thread(os.path.realpath, os.path.expanduser(raw_path))
     # Checked first, so no record below ever carries an over-limit path: the maps keep
     # a value only within their per-value limit (a Windows long path can pass it).
     too_long = thread_override_slots.setter_refusal("project", resolved)
@@ -914,7 +933,7 @@ async def _bang_project(
             channel, "Cannot use sensitive path as project directory.", reply_ts
         )
         return ""
-    if not os.path.isdir(resolved):
+    if not await asyncio.to_thread(os.path.isdir, resolved):
         sel().log_tool_invocation(
             session_key=session_key,
             source="slack",
@@ -1068,7 +1087,11 @@ async def _bang_channel(
                 )
                 return ""
             agent_name = resolved
-        await run_config_write(_persist_channel_config, channel, agent=agent_name)
+        try:
+            await run_config_write(_persist_channel_config, channel, agent=agent_name)
+        except ValueError as e:
+            await slack.post_message(channel, f"❌ {e}", reply_ts)
+            return ""
         _reload_orch_cfg()
         sel().log_api_access(
             caller=user_id,
@@ -1090,7 +1113,11 @@ async def _bang_channel(
         )
         return ""
 
-    await run_config_write(_persist_channel_config, channel, activation=subcmd)
+    try:
+        await run_config_write(_persist_channel_config, channel, activation=subcmd)
+    except ValueError as e:
+        await slack.post_message(channel, f"❌ {e}", reply_ts)
+        return ""
     _reload_orch_cfg()
     sel().log_api_access(
         caller=user_id,
@@ -1163,7 +1190,9 @@ async def _handle_compact_command(
     # session; try_acquire() serializes against the in-flight turn and the
     # finally always releases.
     if not await sessions.try_acquire(session_key):
-        if sessions.has_session(session_key):
+        if sessions.is_retiring(session_key):
+            await slack.post_message(channel, COMPACT_ACCOUNT_CHANGED_TEXT, reply_ts)
+        elif sessions.has_session(session_key):
             await slack.post_message(
                 channel,
                 "⏳ Still working on your last message — try `!compact` once it finishes.",
@@ -1395,14 +1424,20 @@ async def _route_bang_command(
     session_key: str,
     user_id: str,
     conversation_log: ConversationLog | None,
+    *,
+    voice_replies: bool = True,
 ) -> bool:
     """Run ``!compact`` or a ``!`` command, with the sender gate each one carries.
 
     *cmd_text* is the message with any leading bot mention and privacy modifier
     already stripped. Returns ``True`` when the message was a command the caller must
     not hand to the model -- run, denied, or answered -- and ``False`` when it falls
-    through to the rest of ``_dispatch_before_turn`` (no ``!`` prefix, or a command the
-    dispatcher did not claim).
+    through to the rest of the caller's pre-turn steps, ``_dispatch_before_turn`` on the
+    native path or ``handle_message_transport`` on the transport path (no ``!`` prefix,
+    or a command the dispatcher did not claim).
+
+    *voice_replies* is ``False`` for a caller that never speaks a reply: there the
+    owner's ``!voice`` is answered that replies stay text, not switched on.
     """
     if cmd_text.strip().lower() == "!compact":
         if is_owner(user_id) or is_allowed_user(user_id):
@@ -1500,6 +1535,14 @@ async def _route_bang_command(
                 error="unauthorized sender",
             )
             await slack.post_message(channel, "⛔ Owner-only command.", reply_ts)
+            return True
+        elif not voice_replies and _cmd_word.lower() == "!voice":
+            await slack.post_message(
+                channel,
+                "🔇 Voice replies are not available here: this channel's replies are text"
+                " only. `!voice` works when `messaging.use_transport` is off.",
+                reply_ts,
+            )
             return True
         else:
             reply = await _handle_slash_command(

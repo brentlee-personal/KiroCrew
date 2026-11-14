@@ -51,14 +51,24 @@ FOLDER_PATH_SEP = "/"
 MAX_FOLDER_DEPTH = 20
 
 
+def _stored_order(folder: Mapping[str, Any]) -> int:
+    """A folder's stored ``order`` as a sort key; one ``int()`` cannot read is 0.
+
+    The file is loaded verbatim apart from the id check, so ``null``, a word,
+    a list or ``Infinity`` from a hand edit reach here. Every value ``int()``
+    reads (``"3"``, ``2.5``, ``true``) keeps the position it sorts to today.
+    """
+    try:
+        return int(folder.get("order", 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 class ArtifactFolderStore:
     """Filesystem-backed store for the nested artifact-library folder tree.
 
-    Mirrors the chat-folder subsystem (``dashboard/state_parts/sidebar_stores.py`` folders): a flat
-    JSON list persisted to ``artifact_folders.json`` in the config dir, with
-    nesting expressed via ``parent_id`` pointers rather than nested storage or
-    path strings. Membership lives on the artifact record (``Artifact.folder_id``),
-    not here. Thread-safe via a coarse lock.
+    Mirrors the chat folders in ``dashboard/state_parts/sidebar_stores.py``; the
+    layout is in the module docstring. Thread-safe via a coarse lock.
 
     A folder record is ``{id, name, order, parent_id, icon, color}``:
 
@@ -76,25 +86,14 @@ class ArtifactFolderStore:
         self._path = (path or (config_dir() / self._FILE)).expanduser()
         self._lock = threading.Lock()
         self._folders: _List[dict[str, Any]] = []
-        #: Per-folder icon epoch, bumped under ``self._lock`` by every
-        #: user-visible mutation a generated icon must not outlive: a manual
-        #: icon set, an icon clear, and a rename. An in-flight generation task
-        #: captures the epoch at scheduling time and its write-back
-        #: (:meth:`set_icon_if_epoch`) is dropped unless the epoch is
-        #: unchanged. One invariant closes all three races that a bare
-        #: existence check leaves open and that a value-pin cannot catch: a
-        #: clear (absent -> absent) and a rename (icon untouched) both leave
-        #: the icon VALUE unchanged, so only a counter distinguishes them.
-        #: Deliberately per-folder rather than a store-wide generation
-        #: counter, which would cancel a legitimate icon delivery whenever an
-        #: unrelated folder changed mid-generation. Held per store INSTANCE
-        #: (not module-level as in the chat-folder original, whose folders
-        #: live on DashboardState rather than in a store object) so two stores
-        #: over different JSON paths cannot alias each other's folder ids. In
-        #: memory on purpose -- in-flight tasks die with the process, so the
-        #: epoch has nothing to survive a restart for. Entries are dropped on
-        #: a confirmed folder delete. Mirrors the chat-folder guard
-        #: ``_CHAT_FOLDER_ICON_EPOCHS``.
+        #: Per-folder icon epoch, bumped under ``self._lock`` by a manual icon set,
+        #: an icon clear and a rename. A generation task captures it when scheduled,
+        #: and :meth:`set_icon_if_epoch` drops the write-back if it moved. A counter,
+        #: not a value pin, because a clear or a rename leaves the icon value as it
+        #: was. Per folder, so an unrelated folder's change does not cancel a
+        #: delivery; per store instance, so two stores over different JSON paths
+        #: cannot alias ids. In memory only: in-flight tasks die with the process.
+        #: Entries go on a confirmed delete. Mirrors ``_CHAT_FOLDER_ICON_EPOCHS``.
         self._icon_epochs: dict[str, int] = {}
         self._load()
 
@@ -140,8 +139,15 @@ class ArtifactFolderStore:
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     # Drop entries lacking an id (legacy/corrupt) so downstream
-                    # walks never KeyError on a missing "id".
-                    self._folders = [f for f in raw if isinstance(f, dict) and f.get("id")]
+                    # walks never KeyError on a missing "id", and entries whose
+                    # id is a list or object, which no dict can key on.
+                    self._folders = [
+                        f
+                        for f in raw
+                        if isinstance(f, dict)
+                        and f.get("id")
+                        and not isinstance(f.get("id"), (list, dict))
+                    ]
         except Exception:  # noqa: BLE001 — a corrupt file must not crash boot
             logger.warning("Failed to load artifact folders", exc_info=True)
 
@@ -217,8 +223,18 @@ class ArtifactFolderStore:
         # and folders at the same depth sort by (order, name) whatever their parent.
         return sorted(
             self._folders,
-            key=lambda f: (self._depth(f["id"]), int(f.get("order", 0)), str(f.get("name", ""))),
+            key=lambda f: (self._depth(f["id"]), _stored_order(f), str(f.get("name", ""))),
         )
+
+    def _next_order(self) -> int:
+        """The ``order`` of a new folder: the rule chat tags and columns use.
+
+        Called with ``self._lock`` held. Imported at call time so loading the
+        artifact store does not load the dashboard state module.
+        """
+        from kiro_crew.dashboard.chat_tags_store import _next_order
+
+        return _next_order(self._folders)
 
     def get(self, folder_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -258,7 +274,7 @@ class ArtifactFolderStore:
             folder = {
                 "id": uuid.uuid4().hex[:12],
                 "name": name,
-                "order": len(self._folders),
+                "order": self._next_order(),
                 "parent_id": parent_id,
             }
             if color:
@@ -409,10 +425,8 @@ class ArtifactFolderStore:
             created_any = False
             try:
                 for seg in segments:
-                    # Normalize through the SAME truncation clean_name applies
-                    # on create, so a >100-char segment matches the folder it
-                    # created on a prior call (lookup key == stored name) —
-                    # otherwise repeated resolves would mint duplicates.
+                    # The same truncation create applies, so a >100-char segment
+                    # matches its stored folder instead of minting a duplicate.
                     seg_norm = self.clean_name(seg).lower()
                     match = next(
                         (
@@ -433,7 +447,7 @@ class ArtifactFolderStore:
                         match = {
                             "id": uuid.uuid4().hex[:12],
                             "name": self.clean_name(seg),
-                            "order": len(self._folders),
+                            "order": self._next_order(),
                             "parent_id": parent,
                         }
                         self._folders.append(match)
@@ -541,18 +555,10 @@ class ArtifactFolderStore:
                         f["parent_id"] = parent
             self._folders = [f for f in self._folders if f.get("id") not in affected_ids]
             self._save()
-            # Release the icon-epoch guards only after the removal is
-            # CONFIRMED persisted. _save() raising propagates out of this
-            # block, so the pop is skipped and the guard stays armed. Note
-            # what a failed _save() actually leaves behind: self._folders was
-            # already filtered above, so the folder is gone from memory but
-            # SURVIVES on disk, and any later reload brings it back. Keeping
-            # its epoch is the conservative side of that split -- resetting it
-            # to 0 would let a stale in-flight generation clobber a manual
-            # icon on the record that comes back. After a confirmed delete the
-            # entries have nothing left to guard (set_icon_if_epoch already
-            # drops a folder it cannot re-find); popping keeps the registry
-            # from growing with every deleted id.
+            # Pop the icon epochs only after _save() succeeds. A failed save leaves
+            # the folder on disk, to return on reload, and a reset epoch would let
+            # a stale generation clobber its manual icon. Popping after a confirmed
+            # delete keeps the registry from growing with every deleted id.
             for _gone in affected_ids:
                 self._icon_epochs.pop(_gone, None)
 

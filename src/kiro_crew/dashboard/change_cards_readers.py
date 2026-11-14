@@ -149,8 +149,9 @@ def next_run_at(cron_expr: str, timezone: str | None) -> float | None:
 def one_shot_context(at: str, timezone: str) -> dict[str, Any]:
     """Resolve a one-shot card's local ``at`` to the instant ``POST /api/crons`` takes.
 
-    The zone is the card's own ``timezone``, or the CONFIGURED one when the card
-    names none -- the same default ``parse_time_string`` reads a wall clock in,
+    The zone is the card's own ``timezone`` (``local`` read as the host's zone
+    now), or the default one when the card names none -- the same zone
+    ``parse_time_string`` reads a wall clock in,
     so the card and the route agree on the instant. A time already gone is
     refused here, before a card is shown, exactly as the route would refuse it
     (``at_in_past``). ``once`` and ``run_at_local`` are display facts the card
@@ -163,11 +164,13 @@ def one_shot_context(at: str, timezone: str) -> dict[str, Any]:
         _wall_clock_resolution_error,
         get_local_tz,
         is_valid_timezone,
+        resolve_timezone_name,
     )
 
     tz = timezone or get_local_tz()[0]
     if not is_valid_timezone(tz):
         raise catalog.CardCatalogError("invalid_timezone", f"unknown timezone '{tz[:64]}'")
+    tz = resolve_timezone_name(tz) or "UTC"
     zone = ZoneInfo(tz)
     local = datetime.fromisoformat(at).replace(tzinfo=zone)
     skipped = _wall_clock_resolution_error(local, zone, tz)
@@ -603,7 +606,7 @@ def _page_offer_context(member: str, before: dict[str, Any]) -> dict[str, Any]:
         rec = member_goals.read_goals(slug, member)
     except member_goals.GoalsUnreadable:
         raise catalog.CardCatalogError(
-            "goals_unreadable", "this crewmate's goal record cannot be read"
+            "goals_unreadable", "this Bot's goal record cannot be read"
         ) from None
     if not goal_reminder.knows_its_page(rec):
         raise catalog.CardCatalogError(
@@ -613,7 +616,7 @@ def _page_offer_context(member: str, before: dict[str, Any]) -> dict[str, Any]:
     if target is None or not target.get("replaces"):
         raise catalog.CardCatalogError(
             "not_on_a_template",
-            "this offer is for a crewmate on a template page; with nothing on your tab, "
+            "this offer is for a Bot on a template page; with nothing on your tab, "
             "write your page directly, and with a page of your own, you already have one",
         )
     goals = rec.get("goals") or []
@@ -647,7 +650,7 @@ def _goal_state(member: str, kind: str) -> dict[str, Any]:
         rec = member_goals.read_goals(slug, member)
     except member_goals.GoalsUnreadable:
         raise catalog.CardCatalogError(
-            "goals_unreadable", "this mate's goal record cannot be read"
+            "goals_unreadable", "this Bot's goal record cannot be read"
         ) from None
     out: dict[str, Any] = {
         "exists": True,
@@ -925,7 +928,11 @@ def _capability_state(app: Any, params: dict[str, Any]) -> dict[str, Any]:
         raise catalog.CardCatalogError(exc.code, f"capabilities unavailable: {exc.code}") from None
     touched = {(op.get("section"), op.get("id")) for op in params["draft"]["operations"]}
     rows = [
-        {k: row.get(k) for k in ("section", "id", "state", "value", "present")}
+        {
+            **{k: row.get(k) for k in ("section", "id", "state", "value", "present")},
+            # A crewmate's listed skill has no exact Undo (``capability_inverse``).
+            **({"listed": True} if row.get("listed") else {}),
+        }
         for row in view.get("rows") or []
         if (row.get("section"), row.get("id")) in touched
     ]
@@ -1195,6 +1202,16 @@ async def read_context(
         target = await asyncio.to_thread(resolve_setting, p)
         check_target_params(target, p)
         return {}
+    if kind in (
+        catalog.KIND_SCHEDULE_CREATE,
+        catalog.KIND_SCHEDULE_UPDATE,
+        catalog.KIND_CREWMATE_CREATE,
+    ):
+        # A wall clock below is read in the host's zone for "local" or no zone:
+        # have that zone read before a one-shot becomes an instant.
+        from kiro_crew.host_timezone import ensure_host_timezone
+
+        await ensure_host_timezone()
     if kind == catalog.KIND_SCHEDULE_CREATE and "at" in p:
         return one_shot_context(p["at"], p.get("timezone") or "")
     if kind in (
@@ -1212,7 +1229,11 @@ async def read_context(
         expr = source.get("cron_expr")
         if not expr:
             return {}
-        from kiro_crew.cron_service.schedule import get_local_tz, is_valid_timezone
+        from kiro_crew.cron_service.schedule import (
+            get_local_tz,
+            is_valid_timezone,
+            resolve_timezone_name,
+        )
 
         tz = source.get("timezone") or ""
         if tz and not is_valid_timezone(tz):
@@ -1220,9 +1241,11 @@ async def read_context(
         when = next_run_at(expr, tz)
         if when is None:
             raise catalog.CardCatalogError("invalid_cron", "that cron expression never runs")
-        # No zone on the card: the scheduler runs it in the configured one, so
-        # that is the zone the card names and the next run is shown in.
-        return {"next_run_at": when, "timezone": tz or get_local_tz()[0]}
+        # The IANA zone the scheduler runs it in now: a card with no zone takes
+        # the default one, and "local" is the host's. The browser formats the
+        # next run in this zone, and it cannot read "local".
+        zone = (resolve_timezone_name(tz) or "UTC") if tz else get_local_tz()[0]
+        return {"next_run_at": when, "timezone": zone}
     if kind == catalog.KIND_CREWMATE_CAPABILITIES:
         from kiro_crew.agent_capabilities import CapabilityError
 
@@ -1286,11 +1309,16 @@ async def read_context(
             server_tools,
         )
 
+        mount_only = bool(p.get("mount_only"))
         return {
-            "reach": await asyncio.to_thread(addition_reach_view, state, p["template"]),
+            "reach": await asyncio.to_thread(
+                addition_reach_view, state, p["template"], mount_only=mount_only
+            ),
             "live": live_apply(state),
             "tools": await asyncio.to_thread(server_tools, p["server"]),
-            "grants": await asyncio.to_thread(existing_grants, p["template"], p["server"]),
+            "grants": await asyncio.to_thread(
+                existing_grants, p["template"], p["server"], mount_only=mount_only
+            ),
         }
     if kind == catalog.KIND_MCP_INSTALL:
         return {"detail": await _mcp_detail(p)}
@@ -1317,20 +1345,32 @@ async def _workflow_state(kind: str, params: dict[str, Any], state: Any) -> dict
     overwrite; only the slash command it asks for must still be free. An update is pinned to the revision read here: Apply sends it as
     ``expected_revision``, and any save in between is a change since the preview.
     """
+    from kiro_crew.workflows.library import command_ref
+
     svc = _workflow_service(state)
     if kind == catalog.KIND_WORKFLOW_SAVE:
         # The command the card shows, asked for or derived from the name, and
         # whether it is free, read again before Apply, so a save that takes it in
         # between is a change since the preview.
         slug = catalog.workflow_save_slug(params)
-        taken = await asyncio.to_thread(svc.get_definition, slug)
-        return {"slug": slug, "slug_taken": taken is not None}
+        # The allocator's own check: a slug a removed workflow holds is taken
+        # though no ref reaches it.
+        taken = await asyncio.to_thread(svc.slug_taken, slug)
+        return {"slug": slug, "slug_taken": bool(taken)}
     definition = await asyncio.to_thread(svc.get_definition, params["workflow"])
     if not isinstance(definition, dict):
         return {"exists": False}
     return {
         "exists": True,
         "id": str(definition.get("id") or ""),
+        # The ref later reads and the Apply PATCH address: the id, unless the
+        # read lists it as shadowed (a copy restored beside its tombstone), then
+        # the free slug that still reaches it, pinned by ``id``.
+        "ref": (
+            str(definition.get("id") or "")
+            if definition.get("id") not in (definition.get("shadowed_refs") or [])
+            else command_ref(definition)
+        ),
         "slug": str(definition.get("slug") or ""),
         "name": str(definition.get("name") or ""),
         "description": str(definition.get("description") or ""),
@@ -1405,17 +1445,18 @@ def _unified_hunks(old: list[str], new: list[str]) -> Iterator[str]:
                 yield from ("+" + line for line in new[j1:j2])
 
 
-def _workflow_diff(old: str, new: str) -> str:
-    """Every changed line from the saved script *old* to *new*, or a refusal.
+def workflow_source_diff(old: str, new: str) -> str:
+    """Every changed line from the saved script *old* to *new*, at any size.
 
     A unified diff (:func:`_unified_hunks`, no file headers) with each ``@@``
     hunk header replaced by a separator row naming the lines the hunk spans.
     Hunk headers are matched by their exact shape, never by prefix, because a
     source line such as ``-- x`` or a markdown ``---`` rule is written as
     ``--- x`` / ``----`` once marked as removed, and every changed line must
-    reach the card. A removed line comes from a revision saved earlier, which
-    never passed the card's character checks, so its hidden characters are
-    spelled out (``catalog.escape_hidden_characters``) before it is shown.
+    be shown. Every line's hidden characters are spelled out
+    (``catalog.escape_hidden_characters``): neither a revision saved earlier nor
+    a run's script passed the card's character checks. A card's script did, so
+    on a card that changes only removed lines.
     """
     # Split at ``\n`` only: ``splitlines`` also breaks at U+2028, U+2029 and
     # U+0085, which Python's compiler reads as ordinary characters, so a line it
@@ -1425,11 +1466,14 @@ def _workflow_diff(old: str, new: str) -> str:
         header = _HUNK_HEADER_RE.fullmatch(line)
         if header is not None:
             shown.append(_hunk_separator(header))
-        elif line.startswith("-"):
-            shown.append(catalog.escape_hidden_characters(line))
         else:
-            shown.append(line)
-    diff = "\n".join(shown)
+            shown.append(catalog.escape_hidden_characters(line))
+    return "\n".join(shown)
+
+
+def _workflow_diff(old: str, new: str) -> str:
+    """:func:`workflow_source_diff` for a card, refused when too large to carry whole."""
+    diff = workflow_source_diff(old, new)
     # Counted as the card store counts it: the escaped text.
     if len(json.dumps(diff)) - 2 > WORKFLOW_DIFF_MAX:
         raise catalog.CardCatalogError(
@@ -1461,10 +1505,14 @@ async def _workflow_context(
     if kind != catalog.KIND_WORKFLOW_UPDATE or not before.get("exists"):
         return {}
     definition = await asyncio.to_thread(
-        _workflow_service(state).get_definition, str(before.get("id") or "")
+        _workflow_service(state).get_definition, str(before.get("ref") or before.get("id") or "")
     )
     revision = before.get("revision")
-    if not isinstance(definition, dict) or definition.get("revision") != revision:
+    if (
+        not isinstance(definition, dict)
+        or definition.get("id") != before.get("id")
+        or definition.get("revision") != revision
+    ):
         # The diff must be against the revision Apply pins as ``expected_revision``;
         # a save landing between the two reads would otherwise show a diff against
         # a script the card does not replace.

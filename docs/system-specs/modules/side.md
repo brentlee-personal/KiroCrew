@@ -265,7 +265,10 @@ its notice, broadcasts the partial answer as its own final frame before the noti
 final frame, and carries each stored row's id, so a restored panel draws it as the
 live one did. The other error notices a turn can end with are not stored, so after
 a reload such a turn shows its question without the notice, which is also what
-the model holds.
+the model holds. A failure no earlier arm catches shows the error's own text when
+Kiro Crew worded it for a person (`AcpError.user_worded`, such as a throttle's
+retry advice once the retries are spent), and `(side conversation failed — see
+server logs)` otherwise.
 
 **After the socket connects.** Side frames reach owner sockets only, so whatever
 happens to a side conversation while this tab cannot hear it (after the restore
@@ -291,7 +294,10 @@ its id is retired like a drain's; its text is kept until a cancel for it arrives
 so this tab's own cancel answered after the read still hands the question back
 to the composer once, even when the side was closed before that answer came,
 and even when a new question opened the next conversation meanwhile; that
-cancel is not applied to the newer conversation.
+cancel is not applied to the newer conversation. While this tab's cancel waits
+for its answer, the card's text is kept however many cards later reads drop and
+however many conversations close meanwhile; a close keeps no other dropped card,
+since only that answer reads them (`noteSideQueueCancelWaiting`).
 A card added after the read was sent stays.
 A read with no open conversation, or one that
 shares none of those runs and so describes another conversation (this one was
@@ -400,6 +406,15 @@ slot's side draft when the close came first. A card whose edit is still in
 flight goes back with the edit's wording, and the edit's own result does not
 hand it back a second time.
 
+When another tab sent the close (`origin_client` names a tab other than this
+one), and this tab showed rows or queue cards or handed a question back to its
+composer, it then marks the slot (`sideClosedElsewhere`). Its panel says that
+refreshing the context in another tab cleared this side chat. That line replaces
+an error the panel showed for the closed conversation. It remains until a new
+conversation begins there (a user frame, this tab's send, or a send status for
+the slot) or this tab closes it. A close this tab sent, or one that names no
+tab, shows nothing new.
+
 ## Backend Modules
 
 ### `dashboard/ws.py` — `broadcast_side_queue`
@@ -450,7 +465,12 @@ Four prompt constants, two lifted from the upstream protocol:
 - `SIDE_BOUNDARY_PROMPT_NO_TOOLS` — the variant for a harness outside
   `ACP_BACKENDS_SIDE_READONLY`, saying tools are unavailable.
 - `SIDE_BOUNDARY_PROMPT_NO_SHELL` — the same read-only boundary for a session
-  with no shell tool (claude), naming no shell command.
+  with no shell tool (claude), naming no shell command. A shell-capable side
+  turn gets it too while `name_grant.environment_refusal()` refuses every
+  program name (a PowerShell profile, an inherited `BASH_ENV`, an ambiguous
+  `PATH`): each shell read is then declined and side chat has no card to fall
+  back to. The handler runs that check off the loop, and only for a turn that
+  sends the envelope.
 - `SIDE_BOUNDARY_PROMPT_LISTING` — the read-only boundary for a session that
   can list folders and view images but has no shell and no tool that reads a
   file's text (goose).
@@ -582,8 +602,10 @@ hardened reader refuses a hardlink); its declared `name` equals its stem and is
 the derived name of the base its owner-marked `description` names; no provider
 in the session registry was spawned under it; and the base does not resolve
 where publication looks. A user-scope base resolves while any
-`<agent>.json`/`.md` entry exists or `agent.agent_spec_path` finds a spec
-declaring it (two declaring it still resolves). A project variant is reaped
+`<agent>.json`/`.md` entry exists, `agent.agent_spec_path` finds a spec
+declaring it (two declaring it still resolves), or
+`member_essential_context.linked_global_template_spec` finds a linked entry
+declaring it, the same lookup publication reads the base through. A project variant is reaped
 only when its recorded checkout is gone, or that checkout's `.kiro/agents`
 holds no entry named or declaring the agent; an unreadable or protected
 checkout, a variant recording no checkout or a relative path, one whose
@@ -731,7 +753,10 @@ same mapped name is a deny target and a governance identity, so a deny rule or a
 ceiling's `tools` deny on `web_fetch` binds claude's WebFetch. Only a Side Chat
 session's permission events carry it (`build_permission_event(side_read_only=)`):
 in the main chat a kiro-cli-named rule, such as an `auto_deny_tools` entry for
-shell `grep`, keeps not matching claude's own Grep. The shape rides
+shell `grep`, keeps not matching claude's own Grep. A Hooks-page hook matcher is
+named on every session instead (`harness_tool_id`, through
+`acp/harness_tool_names.CLAUDE_TOOL_IDS_BY_KIRO_TOOL`), because a hook can only
+refuse a call. The shape rides
 `_meta.claudeCode.options`, which only an adapter at
 `CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION` or newer is verified to honour. Below it
 (read from the installed package by `claude_adapter_honours_session_options`) the
@@ -1037,6 +1062,9 @@ action types stay `chat/<name>` and every consumer keeps importing them from
   duplicate cannot overwrite the raw text), `edit` rewrites, `cancel`/`drain`
   remove. Never resurrects a closed side.
 - `sideClose` action drops per-slot side state.
+- `sideClosedElsewhere` action marks a slot another tab closed while this tab
+  showed it (`slotSideClosedElsewhere`); `sideClose` and a new conversation
+  clear it.
 - Cleaned up with the slot's other per-slot state (`evictSlotState` in
   `store/chat/slotResidue.ts`) on `deleteSlot.fulfilled` and when the slot
   leaves the authoritative slot list.
@@ -1045,8 +1073,8 @@ action types stay `chat/<name>` and every consumer keeps importing them from
 
 `case 'chat.side_result':` dispatches `sseSideResult`,
 `case 'chat.side_queue':` dispatches `sseSideQueue` and `case 'chat.side_closed':`
-dispatches `sideClose` (see Wire Protocol), alongside the existing subagent/tool
-dispatch cases.
+dispatches `sideClose`, then `sideClosedElsewhere` for another tab's close (see
+Wire Protocol), alongside the existing subagent/tool dispatch cases.
 
 ## Security & Isolation
 
@@ -1071,6 +1099,7 @@ Backend invariants are covered by `test/test_side.py`:
 | Non-blocking stream | `test_side_turn_returns_before_run_finishes` |
 | Channel separation | `test_side_run_id_never_leaks_to_main_channels` |
 | Tool-rejection fallback | `test_empty_llm_output_produces_visible_fallback` |
+| A worded backend failure reaches the panel, an unworded one does not | `test_side_turn_shows_a_backend_failure_only_when_it_is_worded` |
 | READ_ONLY honours the classifier, never a grant | `test_read_only_policy_refuses_a_write_the_config_grant_matches`, `test_read_only_policy_refuses_an_app_own_server_grant`, `test_read_only_policy_classifies_a_read_the_grant_also_matches`, `test_read_only_policy_does_not_trust_a_read_kind_alone` (`test/test_llm_helpers_tool_gate.py`) |
 | READ_ONLY proof is host-trusted only | `test_read_only_policy_rejects_a_read_kind_on_a_mutating_tool`, `test_read_only_policy_rejects_a_read_kind_with_no_host_identity`, `test_read_only_policy_rejects_a_host_known_name_without_trusted_provenance`, `test_read_only_policy_rejects_a_read_looking_title_alone`, `test_read_only_policy_rejects_an_mcp_tool_with_a_read_kind`, `test_read_only_policy_rejects_a_host_known_read_tool_under_a_non_read_kind`, `test_read_only_policy_approves_a_host_known_read_tool`, `test_read_only_policy_approves_a_read_only_shell_command`, `test_hook_based_policy_still_approves_a_read_kind_tool` (`test/test_llm_helpers_tool_gate.py`); `TestClassifierOnlyHostTrustedProof` (`test/test_hooks_trusted_identity.py`) |
 | Dashboard-bound profile governs a side turn | `test_dashboard_bound_profile_governs_a_side_turn` (`test/test_side_turn_confinement.py`), `test_side_key_binds_the_dashboard_surface` (`test/test_governance_profiles.py`), `TestInferSource` (`test/test_sel.py`) |

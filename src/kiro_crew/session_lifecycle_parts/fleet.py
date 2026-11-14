@@ -183,9 +183,14 @@ async def drain_active_turns(self: SessionLifecycleService, timeout: float | Non
     async with owner._lock:
         providers = [session.provider for session in owner._sessions.values()]
     # Already-cancelled turns can report inactive before the native done ack;
-    # unfinished is the signal that the native lock may still be held.
+    # unfinished is the signal that the native lock may still be held. A turn that
+    # runs on outside this gateway (a Kiro Cloud turn) is not drained; the flag is
+    # read as an exact True so only a provider that declares it counts.
     unfinished = [
-        provider for provider in providers if self._deps.provider_has_unfinished_turn(provider)
+        provider
+        for provider in providers
+        if self._deps.provider_has_unfinished_turn(provider)
+        and getattr(provider, "turn_survives_disconnect", False) is not True
     ]
     if not unfinished:
         return 0
@@ -340,7 +345,7 @@ async def close_all(self: SessionLifecycleService, drain_timeout: float | None =
             # discarded_sid. Do not map the live child's sid back at shutdown.
             if sess.retire_on_identity_change:
                 continue
-            cwd_str = sess.provider.cwd
+            cwd_str = "" if sess.cwd_retracted else sess.provider.cwd
             if isinstance(sess.provider, acp_provider_type):
                 sid = sess.provider.client._session_id
                 # A replay-pending fresh child is not yet the durable

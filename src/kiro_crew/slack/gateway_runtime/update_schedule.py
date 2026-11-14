@@ -337,6 +337,15 @@ async def _prepare_auto_update_apply(
     if not paused:
         self._update_apply_deferred = True
         return False
+    # Read with no await since the pause returned, so the gate cannot slip in.
+    if getattr(self, "_update_pause_holder", None) == "restart_gate":
+        # The restart gate just told a caller this gateway is idle and holds
+        # the (re-entrant) pause for that caller's restart: an apply started
+        # now would be cut off by it. The pause stays the gate's.
+        logger.info("Auto-update deferred: a restart this gateway approved is pending")
+        self._update_apply_deferred = True
+        return False
+    self._update_pause_holder = "auto_update"
 
     turn_busy, background_busy = self._in_flight_work_counts()
     busy = turn_busy + background_busy
@@ -367,7 +376,14 @@ async def _prepare_auto_update_apply(
             background_busy,
         )
 
-    if await sessions.resume_turn_admission_after_update():
+    # The holder is cleared only once the resume returned (no await between):
+    # a gate pause queued behind this resume returns re-entrantly on this
+    # apply's pause, and must still see it as the apply's, not take it.
+    try:
+        reopened = await sessions.resume_turn_admission_after_update()
+    finally:
+        self._update_pause_holder = None
+    if reopened:
         self._schedule_inbound_replay()
     self._update_apply_deferred = True
     logger.info("Auto-update deferred: %d in-flight turn(s)", busy)
@@ -386,6 +402,10 @@ async def _finish_auto_update_apply(self: GatewayOrchestrator) -> None:
     sessions = self.sessions
     if sessions is None:
         return
+    # The holder is cleared only once the resume returned, with no await
+    # between: a pause queued behind this resume returns re-entrantly on the
+    # pause being released, and must still see whose it is (and stand aside)
+    # rather than take it and have it reopened under it.
     try:
         reopened = await sessions.resume_turn_admission_after_update()
     except Exception:
@@ -393,6 +413,129 @@ async def _finish_auto_update_apply(self: GatewayOrchestrator) -> None:
     else:
         if reopened:
             self._schedule_inbound_replay()
+    finally:
+        self._update_pause_holder = None
+
+
+#: How long an idle answer from the restart gate keeps turn admission paused
+#: while the caller's restart lands. A restart that never comes (the caller
+#: died, or its restart failed) must not leave the gateway refusing turns, so
+#: admission reopens after this.
+_RESTART_GATE_HOLD_SECS = 60.0
+
+
+async def _restart_gate_when_idle(self: GatewayOrchestrator) -> tuple[bool, int, int]:
+    """Say whether a restart now would interrupt work, as ``(idle, turns, background)``.
+
+    The check behind ``kirocrew restart --when-idle``. It takes the pause the
+    automatic apply takes (``pause_turn_admission_for_update``) and runs the
+    same census (``_in_flight_work_counts``), so a remote restart waits for the
+    work a local update would wait for. Busy: admission reopens at once and
+    the counts go back to the caller, who asks again later. Idle: admission
+    stays paused, so no turn starts between this answer and the restart, and
+    reopens after ``_RESTART_GATE_HOLD_SECS`` if no restart arrives. While that
+    hold is live every further ask answers busy and leaves the hold alone.
+
+    A pause someone else holds (an apply under way, or the final drain of a
+    stop) is not this gate's to take or release, so it answers busy. The pause
+    is re-entrant, so ``_update_pause_holder`` says whose it is: the gate sets
+    ``"restart_gate"``, ``_prepare_auto_update_apply`` sets ``"auto_update"``,
+    each right after its pause returns with no await between, and each
+    defers to the other. A gate ask whose pause returns on a pause another
+    gate ask still holds defers to it too. A stop
+    already signalled answers busy too: that gateway is going down anyway,
+    and the caller's next ask finds it gone.
+    """
+    if shutdown_event.is_set():
+        return False, 0, 0
+    sessions = self.sessions
+    # Fixtures built with ``__new__`` skip ``__init__``, hence the default.
+    hold = getattr(self, "_restart_gate_hold", None)
+    if hold is not None and not hold.done():
+        # A restart this gate already approved is on its way. Another ask is
+        # busy, and the approval's hold and pause are left exactly as they are:
+        # releasing them would reopen admission under that pending restart.
+        turns, background = self._in_flight_work_counts()
+        return False, turns, background
+    if sessions is not None:
+        if sessions.admission_closed:
+            turns, background = self._in_flight_work_counts()
+            return False, turns, background
+        try:
+            paused = await sessions.pause_turn_admission_for_update()
+        except Exception:
+            logger.exception("Restart gate could not pause turn admission")
+            paused = False
+        if not paused:
+            turns, background = self._in_flight_work_counts()
+            return False, turns, background
+        # Read with no await since the pause returned. The pause is re-entrant,
+        # so whoever took it while this waited for the lock still owns it -- an
+        # apply, or another gate ask whose resume is queued behind this pause:
+        # busy, and not this gate's to take or release.
+        if getattr(self, "_update_pause_holder", None) is not None:
+            turns, background = self._in_flight_work_counts()
+            return False, turns, background
+        self._update_pause_holder = "restart_gate"
+    turns, background = self._in_flight_work_counts()
+    # An update the dashboard started (``api_update_apply``) runs its policy
+    # installer as a tracked task the census does not count; the restart's
+    # shutdown would cancel it mid-install, so it is work a restart interrupts.
+    background += len(self._dashboard_policy_applies())
+    # So does its git update (the ``dashboard-update`` task): cut off between
+    # its fast-forward and its reinstall, it leaves a tree whose dependencies
+    # were never installed.
+    state = getattr(self, "dashboard_state", None)
+    background += sum(
+        1
+        for task in list(getattr(state, "_background_tasks", None) or ())
+        if callable(getattr(task, "get_name", None))
+        and task.get_name() == "dashboard-update"
+        and not task.done()
+    )
+    if turns + background > 0:
+        await self._finish_auto_update_apply()
+        logger.info(
+            "Restart gate: busy with %d turn(s) and %d background workload(s)", turns, background
+        )
+        return False, turns, background
+    if sessions is not None:
+        task = asyncio.create_task(self._release_restart_gate_hold(), name="restart-gate-hold")
+        self._restart_gate_hold = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+    logger.info("Restart gate: idle; turn admission paused for the restart")
+    return True, 0, 0
+
+
+def _restart_gate_held(self: GatewayOrchestrator) -> bool:
+    """Whether a restart the idle gate approved is still on its way.
+
+    Synchronous, so ``api_update_apply`` reads it and launches its installer
+    with no await between: an installer started under that hold is cut off by
+    the restart.
+    """
+    hold = getattr(self, "_restart_gate_hold", None)
+    return hold is not None and not hold.done()
+
+
+async def _release_restart_gate_hold(self: GatewayOrchestrator) -> None:
+    """Reopen admission the restart gate paused, once its restart did not arrive.
+
+    Left alone once an update restart fenced the pause, or once the pause is no
+    longer the gate's (``_update_pause_holder``).
+    """
+    await asyncio.sleep(self._RESTART_GATE_HOLD_SECS)
+    sessions = self.sessions
+    if sessions is None or getattr(sessions, "update_restart_fenced", False):
+        return
+    if getattr(self, "_update_pause_holder", None) != "restart_gate":
+        return
+    logger.warning(
+        "Restart gate: no restart within %ss of an idle answer; reopening turn admission",
+        self._RESTART_GATE_HOLD_SECS,
+    )
+    await self._finish_auto_update_apply()
 
 
 def _wheel_apply_module() -> Any:
@@ -891,6 +1034,11 @@ async def _restart_after_update_claimed(
             self._update_apply_deferred = True
             logger.warning("Update restart fence lost to real shutdown; deferring restart")
             return
+        # A planned restart: the turns close_all() cuts resume on the next boot.
+        # Already loaded by ``updates_apply``, so a replaced tree cannot fail it.
+        from kiro_crew.dashboard import restart_resume
+
+        await restart_resume.record_running_slots(self.dashboard_state)
         await sessions.close_all()
         # close_all() cut every dashboard turn that was mid-reply, and each one
         # saves the text its user watched stream as it unwinds, after the save
@@ -915,14 +1063,31 @@ async def _restart_after_update_claimed(
     # registers its stop with the pre-exec seam. Bounded and never raises.
     await run_pre_exec_stops()
 
+    from kiro_crew.dashboard import crash_dump_store
+
     # Any callback that ran while close_all awaited used the synchronous
     # fenced refusal path. Drain pre-fence workers and registered handlers
-    # one final time; never cancel or force through them.
-    await self._drain_update_callback_work(timeout=None)
+    # one final time; never cancel or force through them. The exec skips the
+    # orderly exit that marks the crash dump clean, so mark it after that
+    # drain, never over it: a SIGKILL while it hangs must not read as clean.
+    # Then look once more without waiting: work that arrived while the mark
+    # was written withdraws it and is drained first. A drain that gave up (an
+    # unreadable callback count) goes on to the exec, as it always did.
+    while True:
+        drained = await self._drain_update_callback_work(timeout=None)
+        await crash_dump_store.mark_clean_exit()
+        try:
+            if not drained or await self._drain_update_callback_work(timeout=0.0):
+                break
+        except BaseException:
+            await crash_dump_store.unmark_clean_exit()
+            raise
+        await crash_dump_store.unmark_clean_exit()
     if shutdown_event.is_set():
         # The operator asked this process to stop while the restart was
         # being prepared. Exec'ing would swallow that stop; the applied
         # update takes effect at the next start instead.
+        await crash_dump_store.unmark_clean_exit()
         logger.info("Update applied; restart skipped because the gateway is shutting down")
         return
     logger.info("Update callback drain complete, restarting gateway")
@@ -940,6 +1105,7 @@ async def _restart_after_update_claimed(
         else:
             platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
     except OSError:
+        await crash_dump_store.unmark_clean_exit()
         await platform_compat.exit_after_failed_restart_exec(launcher or exe)
 
 
@@ -1146,9 +1312,10 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
                 # told to "run `kirocrew update`": that command re-runs the
                 # installer, which adds a second copy and leaves this process
                 # on the old version. Give it the in-place upgrade hint
-                # instead — the same words `kirocrew update` itself now
-                # prints for this shape. pipx and the managed venv keep the
-                # `kirocrew update` pointer, which upgrades them correctly.
+                # instead, the command `kirocrew update` prints for this
+                # shape, and say it runs from the user's own terminal: an
+                # agent can read this log line. pipx and the managed venv keep
+                # the `kirocrew update` pointer, which upgrades them correctly.
                 from kiro_crew.platform.update_layout import (
                     PipUpgradeHint,
                     non_managed_pip_update_hint,
@@ -1201,8 +1368,8 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
                     logged_upgrade = redact_log_via_context(upgrade.command)
                     logger.warning(
                         "Version compliance: running %s is below the policy minimum %s, "
-                        "but this install (%s) cannot apply it unattended (%s) — upgrade "
-                        "this environment in place with `%s`, then `%s`",
+                        "but this install (%s) cannot apply it unattended (%s) — from your "
+                        "own terminal, upgrade this environment in place with `%s`, then run `%s`",
                         _running_version,
                         min_version(),
                         info.get("managed_by") or "unknown",
@@ -1222,7 +1389,8 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
                     logger.warning(
                         "Version compliance: running %s is below the policy minimum %s, "
                         "but this install (%s) cannot apply it unattended (%s) — the "
-                        "signed upgrade %s Once upgraded, run `%s`",
+                        "signed upgrade %s Once upgraded, run `%s`. Run both steps from your "
+                        "own terminal.",
                         _running_version,
                         min_version(),
                         info.get("managed_by") or "unknown",
@@ -1318,6 +1486,10 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
                         "Update %s was put off by the user — not installing it unattended",
                         info.get("latest_version"),
                     )
+                elif cfg.auto_update and effect.manual_only:
+                    # The operator's policy chose this, so it is not a fault: the
+                    # provider path logs the same case at INFO.
+                    logger.info("Auto-update is on, but %s — notifying instead", effect.reason)
                 elif cfg.auto_update and not installs:
                     logger.warning(
                         "Auto-update is on, but this install (%s) cannot apply it "

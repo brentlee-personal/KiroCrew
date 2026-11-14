@@ -51,6 +51,13 @@ function link(href = 'https://tickets.example.com/t/TK-1', scoped = true) {
   document.body.append(holder)
   return a
 }
+/** The chat scrolls: `a` moves by `dy`, then the scroll event fires. */
+function scrollChat(a: HTMLElement, dy = -120) {
+  const r = a.getBoundingClientRect()
+  const top = r.top + dy
+  a.getBoundingClientRect = () => ({ ...r, top, y: top, bottom: top + r.height, toJSON() {} })
+  fireEvent.scroll(window)
+}
 /** Hover `a`, let the frame load and answer `ready`, and return what it was sent. */
 async function hoverReady(a: HTMLElement) {
   fireEvent.pointerOver(a)
@@ -112,7 +119,7 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
 
   for (const [how, dismiss] of [
     ['leaves', (a: HTMLElement, other: HTMLElement) => fireEvent.pointerOut(a, { relatedTarget: other })],
-    ['scrolls', () => fireEvent.scroll(window)],
+    ['scrolls', (a: HTMLElement) => scrollChat(a)],
     ['presses Escape', () => fireEvent.keyDown(document, { key: 'Escape' })],
   ] as const) {
     it(`a show still waiting for a loading frame is dropped when the user ${how}`, async () => {
@@ -131,6 +138,147 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
       expect(types(sent)).not.toContain('show')
     })
   }
+
+  it('a scroll that does not move the link keeps a show waiting for a loading frame', async () => {
+    await mount()
+    const a = link()
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const el = theFrame()
+    const sent = watch(el)
+    // Something else scrolls (the transcript settling after a reload): the link stays put.
+    fireEvent.scroll(window)
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    fromFrame(el, 'ready')
+    await waitFor(() => expect(types(sent)).toContain('show'))
+    expect(types(sent)).not.toContain('hide')
+  })
+
+  it('a scroll, moving the link or not, keeps the card the pointer is in', async () => {
+    await mount()
+    const a = link()
+    const { el, sent } = await hoverReady(a)
+    fromFrame(el, 'open')
+    fireEvent.pointerOut(a, { relatedTarget: el }) // into the card
+    fireEvent.scroll(window)
+    expect(el.style.visibility).toBe('visible')
+    // The chat scrolling moves the link; the shown card still stays.
+    scrollChat(a)
+    expect(el.style.visibility).toBe('visible')
+    expect(types(sent)).not.toContain('hide')
+  })
+
+  it('a shown card survives a scroll that moves its link, and goes on the first pointer move outside it', async () => {
+    await mount()
+    const a = link()
+    const other = document.createElement('div')
+    document.body.append(other)
+    fireEvent.pointerMove(a, { clientX: 110, clientY: 58 })
+    const { el, sent } = await hoverReady(a)
+    fromFrame(el, 'open')
+    // A streaming reply scrolls the chat: the link moves out from under the pointer.
+    scrollChat(a)
+    // What the browser reports for that scroll, with the pointer where it was.
+    fireEvent.pointerOut(a, { relatedTarget: other, clientX: 110, clientY: 58 })
+    fireEvent.pointerMove(other, { clientX: 110, clientY: 58 })
+    expect(el.style.visibility).toBe('visible')
+    expect(types(sent)).not.toContain('hide')
+    expect(types(sent)).not.toContain('leave')
+    // The pointer moves, outside the card and the link: the usual leave, then
+    // the card closes itself (its leave grace is the app's).
+    fireEvent.pointerMove(other, { clientX: 140, clientY: 90 })
+    expect(sent.at(-1)).toMatchObject({ type: 'leave' })
+    fromFrame(el, 'close')
+    expect(el.style.visibility).toBe('hidden')
+  })
+
+  it('after such a scroll, a card hovered before any pointer move still goes on the first move outside it', async () => {
+    await mount()
+    const a = link()
+    const other = document.createElement('div')
+    document.body.append(other)
+    // A reply slid the link under a pointer that has not moved since the page loaded.
+    fireEvent.pointerOver(a, { clientX: 110, clientY: 58 })
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const el = theFrame()
+    const sent = watch(el)
+    fromFrame(el, 'ready')
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    fromFrame(el, 'open')
+    scrollChat(a)
+    fireEvent.pointerMove(other, { clientX: 110, clientY: 58 })
+    expect(types(sent)).not.toContain('leave')
+    fireEvent.pointerMove(other, { clientX: 140, clientY: 90 })
+    expect(sent.at(-1)).toMatchObject({ type: 'leave' })
+  })
+
+  it('after such a scroll, many sub-pixel moves outside the link add up to a leave', async () => {
+    await mount()
+    const a = link()
+    const other = document.createElement('div')
+    document.body.append(other)
+    fireEvent.pointerMove(a, { clientX: 110, clientY: 58 })
+    const { el, sent } = await hoverReady(a)
+    fromFrame(el, 'open')
+    scrollChat(a)
+    // A slow move at high zoom: each step is half a CSS pixel.
+    fireEvent.pointerMove(other, { clientX: 110.5, clientY: 58 })
+    expect(types(sent)).not.toContain('leave')
+    fireEvent.pointerMove(other, { clientX: 111, clientY: 58 })
+    expect(sent.at(-1)).toMatchObject({ type: 'leave' })
+  })
+
+  it('after such a scroll, a link slid under the still pointer is no hover, and moving onto it leaves the kept card', async () => {
+    await mount()
+    const a = link()
+    fireEvent.pointerMove(a, { clientX: 110, clientY: 58 })
+    const { el, sent } = await hoverReady(a)
+    fromFrame(el, 'open')
+    scrollChat(a)
+    const b = link('https://tickets.example.com/t/TK-2')
+    // The scroll slides b under the pointer, which has not moved.
+    fireEvent.pointerOver(b, { clientX: 110, clientY: 58 })
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(types(sent)).not.toContain('leave')
+    expect(sent.filter((m) => m.type === 'show')).toHaveLength(1)
+    expect(el.style.visibility).toBe('visible')
+    // A real move onto b: the kept card gets its leave, and b's hover starts.
+    fireEvent.pointerOver(b, { clientX: 112, clientY: 60 })
+    expect(sent.at(-1)).toMatchObject({ type: 'leave' })
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(sent.filter((m) => m.type === 'show')).toHaveLength(2)
+  })
+
+  it('a show still in its hover delay is cancelled by a scroll that moves its link', async () => {
+    await mount()
+    const a = link()
+    const { el, sent } = await hoverReady(a)
+    fromFrame(el, 'open')
+    const b = link('https://tickets.example.com/t/TK-2')
+    fireEvent.pointerOver(b) // the card for a is still shown; b's show is pending
+    scrollChat(b)
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(sent.filter((m) => m.type === 'show')).toHaveLength(1)
+    expect(sent.at(-1)).toMatchObject({ type: 'hide', reason: 'scroll' })
+  })
+
+  it('a card unpinned after a later hover still goes on a scroll that leaves the later link in place', async () => {
+    await mount()
+    const a = link()
+    const { el: first } = await hoverReady(a)
+    fromFrame(first, 'open')
+    fromFrame(first, 'pin', { pinned: true })
+    const b = link('https://tickets.example.com/t/TK-2')
+    fireEvent.pointerOver(b)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const second = [...document.querySelectorAll<HTMLIFrameElement>('iframe[data-link-preview-frame]')].find((f) => f !== first)
+    if (!second) throw new Error('no second frame')
+    fromFrame(second, 'ready')
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    fromFrame(first, 'pin', { pinned: false })
+    fireEvent.scroll(window) // b stays put; the unpinned card from a's hover still goes
+    expect(first.isConnected).toBe(false)
+  })
 
   it('a frame removed while loading does not report a load failure later', async () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -167,17 +315,17 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
     expect(el.style.left).toBe(`${window.innerWidth - 300 - 8}px`)
     // Pinned: the chat scrolling does not take it away.
     fromFrame(el, 'pin', { pinned: true })
-    fireEvent.scroll(window)
+    scrollChat(a)
     expect(el.isConnected).toBe(true)
     expect(el.style.visibility).toBe('visible')
     expect(types(sent)).not.toContain('hide')
-    // Unpinned again: the next scroll does.
+    // Unpinned again: Escape takes it away.
     fromFrame(el, 'pin', { pinned: false })
-    fireEvent.scroll(window)
-    expect(sent.at(-1)).toMatchObject({ type: 'hide', reason: 'scroll' })
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(sent.at(-1)).toMatchObject({ type: 'hide', reason: 'escape' })
   })
 
-  it('an unpinned card hides on scroll and Escape, and leave() reaches the frame', async () => {
+  it('an unpinned card hides on Escape and blur, never on scroll, and leave() reaches the frame', async () => {
     await mount()
     const a = link()
     const other = document.createElement('div')
@@ -186,9 +334,13 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
     fromFrame(el, 'open')
     fireEvent.pointerOut(a, { relatedTarget: other })
     expect(types(sent)).toContain('leave')
-    fireEvent.scroll(window)
+    scrollChat(a)
+    expect(el.style.visibility).toBe('visible')
+    expect(types(sent)).not.toContain('hide')
+    fireEvent.blur(window)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
     expect(el.style.visibility).toBe('hidden')
-    expect(sent.at(-1)).toMatchObject({ type: 'hide', reason: 'scroll' })
+    expect(sent.at(-1)).toMatchObject({ type: 'hide', reason: 'blur' })
     fromFrame(el, 'open')
     fromFrame(el, 'escape') // Escape pressed inside the card
     expect(el.style.visibility).toBe('hidden')
@@ -284,6 +436,7 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
     expect(document.querySelector('[data-testid="link-preview-failed"] [role="alert"]')).not.toBeNull()
     expect(listApps).toHaveBeenCalledTimes(2)
     fireEvent.pointerOut(a, { relatedTarget: document.body })
+    await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS) })
     expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
   })
 
@@ -311,6 +464,7 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
     const hover = async () => {
       fireEvent.pointerOut(a, { relatedTarget: other })
       fireEvent.pointerOver(other)
+      await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS) })
       fireEvent.pointerOver(a)
       await act(async () => { await vi.advanceTimersByTimeAsync(400) })
     }
@@ -331,6 +485,225 @@ describe('LinkPreviewLayer: the card runs in a sandboxed frame', () => {
     fromFrame(el, 'failed', { message: 'module exports no activate(ctx)' })
     expect(el.isConnected).toBe(false)
     errors.mockRestore()
+  })
+
+  it('a failed load shows a card with its reason; Retry loads a fresh frame, and its success shows the normal card', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await mount()
+    const a = link()
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const first = theFrame()
+    await act(async () => { fromFrame(first, 'failed', { message: 'activate threw' }) })
+    const card = document.querySelector<HTMLElement>('[data-testid="link-preview-failed"]')
+    expect(card).not.toBeNull()
+    expect(card?.getAttribute('role')).toBe('group')
+    expect(card?.getAttribute('aria-label')).toBeTruthy()
+    expect(card?.dataset.cause).toBe('app')
+    // The same surface as a card: placed below the link, at a card's width.
+    expect(card?.className).toMatch(/rounded-lg/)
+    expect(card?.className).toMatch(/bg-bg-elevated/)
+    expect(card?.style.top).toBe(`${50 + 16 + 6}px`)
+    expect(card?.style.width).toBe('360px')
+    expect(card?.querySelector('[role="alert"]')?.textContent).toMatch(/error/i)
+    // The pointer moves from the link into the card: the card stays.
+    fireEvent.pointerOut(a, { relatedTarget: card })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).not.toBeNull()
+
+    const retry = document.querySelector<HTMLButtonElement>('[data-testid="link-preview-retry"]')
+    if (!retry) throw new Error('no Retry')
+    await act(async () => { fireEvent.click(retry) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(mint).toHaveBeenCalledTimes(2) // inside RETRY_AFTER_MS: only Retry loads it again
+    const second = theFrame()
+    expect(second).not.toBe(first)
+    expect(first.isConnected).toBe(false)
+    expect(retry.disabled).toBe(true)
+    const sent = watch(second)
+    fromFrame(second, 'ready')
+    await waitFor(() => expect(sent.find((m) => m.type === 'show')).toMatchObject({ url: 'https://tickets.example.com/t/TK-1' }))
+    await waitFor(() => expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull())
+    fromFrame(second, 'open')
+    expect(second.style.visibility).toBe('visible')
+    // The hover ends as if the pointer had moved from the link into the app's
+    // card: the app is told `leave`, and the same link can be hovered again.
+    expect(types(sent).slice(types(sent).indexOf('show'))).toContain('leave')
+    const shows = () => types(sent).filter((t) => t === 'show').length
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(shows()).toBe(2)
+    errors.mockRestore()
+  })
+
+  it("a Retry that completes after the pointer moved to another link of the same app leaves that link's hover alone", async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await mount()
+    const a = link()
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    await act(async () => { fromFrame(theFrame(), 'failed', { message: 'boom' }) })
+    const retry = document.querySelector<HTMLButtonElement>('[data-testid="link-preview-retry"]')
+    if (!retry) throw new Error('no Retry')
+    await act(async () => { fireEvent.click(retry) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const second = theFrame()
+    const sent = watch(second)
+    fireEvent.pointerOver(link('https://tickets.example.com/t/TK-2'))
+    fromFrame(second, 'ready') // A's Retry completes inside B's hover delay
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    const shows = sent.filter((m) => m.type === 'show')
+    expect(shows.at(-1)).toMatchObject({ url: 'https://tickets.example.com/t/TK-2' })
+    errors.mockRestore()
+  })
+
+  it('a provider refresh closes the failure card, so a Retry never resends a link built from the old list', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { qc } = await mount()
+    fireEvent.pointerOver(link())
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    await act(async () => { fromFrame(theFrame(), 'failed', { message: 'boom' }) })
+    const retry = document.querySelector<HTMLButtonElement>('[data-testid="link-preview-retry"]')
+    if (!retry) throw new Error('no Retry')
+    await act(async () => { fireEvent.click(retry) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const second = theFrame()
+    expect(retry.disabled).toBe(true)
+    listApps.mockResolvedValue([APP, {
+      name: 'other-app', enabled: true,
+      manifest: { contributes: { linkPreviews: [{ id: 'cards', entry: 'dist/o.mjs', hosts: ['other.example.com'] }] } },
+    }])
+    await act(async () => { await qc.invalidateQueries({ queryKey: ['apps'] }) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) }) // the hover effect re-runs, dropping the pending show
+    await act(async () => { fromFrame(second, 'ready') })
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
+    expect(sentTo(second).some((m) => m.type === 'show')).toBe(false)
+    errors.mockRestore()
+  })
+
+  it("moving from a Retry's card onto another app's link drops that Retry's show", async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    listApps.mockResolvedValue([APP, {
+      name: 'other-app', enabled: true,
+      manifest: { contributes: { linkPreviews: [{ id: 'cards', entry: 'dist/o.mjs', hosts: ['other.example.com'] }] } },
+    }])
+    const { mod } = await mount()
+    const a = link()
+    const b = link('https://other.example.com/x')
+    // B's provider fails first, so B is inside its cooldown later.
+    fireEvent.pointerOver(b)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    await act(async () => { fromFrame(theFrame(), 'failed', { message: 'boom' }) })
+    fireEvent.pointerOut(b, { relatedTarget: document.body })
+    await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS) })
+    // A fails, Retry starts loading A's frame.
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    await act(async () => { fromFrame(theFrame(), 'failed', { message: 'boom' }) })
+    const card = document.querySelector<HTMLElement>('[data-testid="link-preview-failed"]')
+    const retry = document.querySelector<HTMLButtonElement>('[data-testid="link-preview-retry"]')
+    if (!card || !retry) throw new Error('no card')
+    fireEvent.pointerOut(a, { relatedTarget: card })
+    await act(async () => { fireEvent.click(retry) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const second = theFrame()
+    const sent = watch(second)
+    // Card -> B before A's Retry is ready.
+    fireEvent.pointerLeave(card, { relatedTarget: b })
+    fireEvent.pointerOver(b)
+    fromFrame(second, 'ready')
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(sent.some((m) => m.type === 'show')).toBe(false)
+    errors.mockRestore()
+  })
+
+  it('closing the failure card while a Retry loads drops that Retry: no card comes back', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await mount()
+    fireEvent.pointerOver(link())
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    await act(async () => { fromFrame(theFrame(), 'failed', { message: 'boom' }) })
+    const retry = document.querySelector<HTMLButtonElement>('[data-testid="link-preview-retry"]')
+    if (!retry) throw new Error('no Retry')
+    await act(async () => { fireEvent.click(retry) })
+    const close = document.querySelector<HTMLButtonElement>('[data-testid="link-preview-failed"] button[aria-label]:not([data-testid])')
+    if (!close) throw new Error('no close')
+    await act(async () => { fireEvent.click(close) })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
+    await act(async () => { await vi.advanceTimersByTimeAsync(READY_TIMEOUT_MS + 10) })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
+    errors.mockRestore()
+  })
+
+  it('the failure card names the cause: a timeout, or an app with no frame', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await mount()
+    const a = link()
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(READY_TIMEOUT_MS + 10) })
+    expect(document.querySelector<HTMLElement>('[data-testid="link-preview-failed"]')?.dataset.cause).toBe('timeout')
+    expect(document.querySelector('[data-testid="link-preview-failed"] [role="alert"]')?.textContent).toMatch(/too long/i)
+    // Escape closes it.
+    fireEvent.keyDown(document.querySelector<HTMLElement>('[data-testid="link-preview-retry"]') ?? document, { key: 'Escape' })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
+
+    mint.mockRejectedValueOnce(new Error('HTTP 404'))
+    const retryAfter = (await import('./LinkPreviewLayer')).RETRY_AFTER_MS
+    await act(async () => { await vi.advanceTimersByTimeAsync(retryAfter) })
+    const b = link('https://tickets.example.com/t/TK-2')
+    fireEvent.pointerOver(b)
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(document.querySelector<HTMLElement>('[data-testid="link-preview-failed"]')?.dataset.cause).toBe('unavailable')
+    errors.mockRestore()
+  })
+
+  it('the failure card stays while the pointer crosses the gap from the link into it', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { mod } = await mount()
+    const a = link()
+    const gap = a.parentElement as HTMLElement
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    await act(async () => { fromFrame(theFrame(), 'failed', { message: 'boom' }) })
+    const card = document.querySelector<HTMLElement>('[data-testid="link-preview-failed"]')
+    if (!card) throw new Error('no card')
+    // Link -> the chat around it (the gap) -> the card, slower than one sample.
+    fireEvent.pointerOut(a, { relatedTarget: gap })
+    await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS - 50) })
+    fireEvent.pointerEnter(card, { relatedTarget: gap })
+    await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS * 2) })
+    expect(card.isConnected).toBe(true)
+    // Leaving the card for somewhere else closes it once the grace has passed.
+    fireEvent.pointerLeave(card, { relatedTarget: gap })
+    expect(card.isConnected).toBe(true)
+    await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS) })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
+    errors.mockRestore()
+  })
+
+  it('with the app list unreadable, leaving the failure card lets the same link show it again', async () => {
+    listApps.mockRejectedValue(new Error('HTTP 500'))
+    const mod = await import('./LinkPreviewLayer')
+    mod.setLinkPreviewMintForTest(mint)
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(createElement(QueryClientProvider, { client: qc }, createElement(mod.default)))
+    await waitFor(() => expect(listApps).toHaveBeenCalledTimes(1))
+    await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+    const a = link()
+    const other = document.createElement('div')
+    document.body.append(other)
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    const card = document.querySelector<HTMLElement>('[data-testid="link-preview-failed"]')
+    if (!card) throw new Error('no card')
+    expect(card.dataset.cause).toBe('unavailable')
+    fireEvent.pointerOut(a, { relatedTarget: card })
+    fireEvent.pointerLeave(card, { relatedTarget: other })
+    await act(async () => { await vi.advanceTimersByTimeAsync(mod.LEAVE_GRACE_MS) })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).toBeNull()
+    fireEvent.pointerOver(a)
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    expect(document.querySelector('[data-testid="link-preview-failed"]')).not.toBeNull()
   })
 
   it('disabling the app hides and disposes its card and removes the frame', async () => {
@@ -461,7 +834,8 @@ describe('LinkPreviewLayer: the protocol is bounded', () => {
 describe('LinkPreviewLayer: overlay mode (a provider with windows of its own)', () => {
   it('covers the viewport, is clipped to the reported regions, and ignores card messages', async () => {
     await mount()
-    const { el, sent } = await hoverReady(link())
+    const a = link()
+    const { el, sent } = await hoverReady(a)
     fromFrame(el, 'regions', { rects: [{ left: 10, top: 20, width: 300, height: 100 }, { left: -50, top: 5, width: 100, height: 10 }] })
     expect([el.style.left, el.style.top, el.style.width, el.style.height]).toEqual(['0px', '0px', `${window.innerWidth}px`, `${window.innerHeight}px`])
     // Off-screen parts are cut to the viewport.
@@ -471,12 +845,41 @@ describe('LinkPreviewLayer: overlay mode (a provider with windows of its own)', 
     fromFrame(el, 'resize', { width: 10, height: 10 })
     expect(el.style.width).toBe(`${window.innerWidth}px`)
     // The chat scrolling tells the provider, which decides what goes; the frame stays.
-    fireEvent.scroll(window)
+    scrollChat(a)
     expect(sent.at(-1)).toMatchObject({ type: 'hide', reason: 'scroll' })
     expect(el.isConnected).toBe(true)
     fromFrame(el, 'regions', { rects: [] })
     expect(el.style.visibility).toBe('hidden')
     expect(el.style.pointerEvents).toBe('none')
+  })
+
+  it('a scroll that keeps another provider\'s shown card still tells the overlay', async () => {
+    const DOCS = {
+      name: 'docs-app',
+      enabled: true,
+      manifest: { contributes: { linkPreviews: [{ id: 'docs', entry: 'dist/lp.mjs', hosts: ['docs.example.com'] }] } },
+    }
+    listApps.mockResolvedValue([APP, DOCS])
+    await mount()
+    const a = link()
+    const { el: overlay, sent: overlaySent } = await hoverReady(a)
+    fromFrame(overlay, 'regions', { rects: [{ left: 10, top: 20, width: 300, height: 100 }] })
+    const b = link('https://docs.example.com/d/1')
+    fireEvent.pointerMove(b, { clientX: 110, clientY: 58 })
+    fireEvent.pointerOver(b, { clientX: 112, clientY: 60 })
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const card = [...document.querySelectorAll<HTMLIFrameElement>('iframe[data-link-preview-frame]')].find((f) => f !== overlay)
+    if (!card) throw new Error('no second frame')
+    const cardSent = watch(card)
+    fromFrame(card, 'ready')
+    await act(async () => { await vi.advanceTimersByTimeAsync(400) })
+    fromFrame(card, 'open')
+    expect(overlaySent.at(-1)).toMatchObject({ type: 'hide', reason: 'other-provider' })
+    // The chat scrolls b away: b's card stays, and the overlay hears the scroll.
+    scrollChat(b)
+    expect(card.style.visibility).toBe('visible')
+    expect(cardSent.some((m) => m.type === 'hide')).toBe(false)
+    expect(overlaySent.at(-1)).toMatchObject({ type: 'hide', reason: 'scroll' })
   })
 })
 

@@ -31,7 +31,7 @@ _MODE_IDENTITY_RE = re.compile(r"## 🔒 Mode Identity.*?(?=\n## |\Z)", re.DOTAL
 
 
 _STOP_EVENT_CAP = 3  # max recent stop events to inject into LLM context
-_STOP_EVENT_RESOLVED_STATES = frozenset({"stopped", "stop_failed_reset"})
+_STOP_EVENT_RESOLVED_STATES = frozenset({"stopped", "stop_failed_reset", "force_stopped"})
 
 
 # Regex patterns for noise compression in assistant messages
@@ -95,6 +95,12 @@ _STEER_STATE_REQUEUED = "requeued"
 # turn either.
 _STEER_STATE_RETRACTED = "retracted"
 _STEER_STATES_NOT_TAKEN = frozenset({_STEER_STATE_REQUEUED, _STEER_STATE_RETRACTED})
+
+# The ``meta.injectKind`` values of an ``inject`` row that continues the turn above
+# it rather than opening one: a recovery (a Resume press, an automatic retry) and a
+# replay of the user's own words (``_TURN_CONTINUING_INJECT_KINDS`` in the
+# dashboard's transcript rows; same reason for the spelling, and a test pins them).
+_CONTINUING_INJECT_KINDS = frozenset({"recovery", "user_replay"})
 
 
 def _is_steer_row(row: dict) -> bool:
@@ -401,7 +407,10 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
     kept: list[dict] = []
     conv = inj = 0
     for m in reversed(messages):
-        role = m["role"]
+        # `.get`, not `[...]`: the transcript is a file anyone can hand-edit, and
+        # one row with no `role` or `content` would otherwise raise out of every
+        # context build for the chat. A row with no role is not a turn either way.
+        role = m.get("role")
         if _is_steer_row(m) and m["meta"].get("steerState") == _STEER_STATE_RETRACTED:
             # Taken back before the turn read it: it was never part of the
             # conversation, and its text was cleared when it was taken back.
@@ -418,7 +427,7 @@ def _quota_tail(messages: list[dict], *, conv_max: int, inject_max: int) -> list
             conv += 1
         else:
             continue
-        kept.append({"role": role, "content": strip_image_refs(m["content"])})
+        kept.append({"role": role, "content": strip_image_refs(m.get("content", ""))})
     kept.reverse()
     return kept
 
@@ -595,13 +604,20 @@ def cancelled_turn_preamble(recent: list[dict], *, user_cap: int, assist_cap: in
     # A steer is a user row, but it was injected into the turn rather than opening
     # it. When the newest user row is one, the request the turn answered is the
     # nearest row before it that could have opened a turn, provided that row is a
-    # plain user row. A nudge, a sub-agent completion or an inject row (whether it
-    # opens a turn depends on its kind) may be the opener, and a window that holds
-    # no opener has none to name: both keep the steer as the request.
+    # plain user row. A recovery or user-replay inject continues the turn, so the
+    # walk steps past it. A nudge, a sub-agent completion or any other inject row
+    # may be the opener, and a window that holds no opener has none to name: both
+    # keep the steer as the request.
     if user_idx >= 0 and _is_steer_row(recent[user_idx]):
         for i in range(user_idx - 1, -1, -1):
             role = recent[i].get("role")
-            if role == "inject" or (role in _TURN_OPENER_ROLES and not _is_steer_row(recent[i])):
+            meta = recent[i].get("meta")
+            continuing = (
+                isinstance(meta, dict) and meta.get("injectKind") in _CONTINUING_INJECT_KINDS
+            )
+            if (role == "inject" and not continuing) or (
+                role in _TURN_OPENER_ROLES and not _is_steer_row(recent[i])
+            ):
                 if role == "user":
                     user_idx = i
                 break

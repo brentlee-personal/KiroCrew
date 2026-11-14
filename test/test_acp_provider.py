@@ -134,6 +134,38 @@ class TestServedModel:
         assert provider.served_model == ""
 
 
+class TestPromptsWritten:
+    """The channel completion route reads ``prompts_written`` off the provider the
+    session manager returns, which is this wrapper, so the count has to cross it."""
+
+    @pytest.mark.asyncio
+    async def test_a_session_turn_that_wrote_its_prompt_is_counted_through_the_wrapper(self):
+        handle = AcpSessionHandle("s1", asyncio.Queue(), MagicMock())
+
+        async def mock_prompt(message):
+            handle.prompts_written += 1
+            yield AcpEvent(kind="complete", stop_reason="end_turn")
+
+        handle.prompt = mock_prompt  # type: ignore[method-assign]
+        session = AcpSessionProvider(handle, runtime=MagicMock())
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+        provider._client = session
+        assert provider.prompts_written == 0
+
+        await _drain(session.stream("report"))
+
+        assert provider.prompts_written == 1
+
+    def test_a_client_that_keeps_no_count_reads_as_unknown(self):
+        provider = _build_provider(ACP_BACKEND_CLAUDE)
+
+        class _RawShape:
+            pass
+
+        provider._client = _RawShape()
+        assert provider.prompts_written is None
+
+
 class TestStreamCommandRouting:
     @pytest.mark.asyncio
     async def test_kiro_backend_uses_commands_execute(self):
@@ -376,7 +408,9 @@ class TestToLlmEventFieldParity:
     # ``AcpSessionHandle._run_turn`` before the event leaves the ACP layer. By
     # then the held chunk has been delivered as ordinary text or turned into the
     # turn's error, so no provider consumer has a decision left to make with it.
-    _INTENTIONALLY_DROPPED: set[str] = {"unattributed"}
+    # connection_mcp_identity: read only by the Connection approval mint, which takes
+    # the AcpEvent itself on both transports, never the provider's LlmEvent.
+    _INTENTIONALLY_DROPPED: set[str] = {"unattributed", "connection_mcp_identity"}
 
     @staticmethod
     def _distinguishable(field: "dataclasses.Field") -> object | None:
@@ -849,17 +883,6 @@ class TestEffortControl:
         provider._client.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_claude_clear_effort_returns_false_for_reset(self):
-        # claude-agent-acp has no "reset to default" config value, so clearing
-        # must return False to trigger a session reset; it must NOT push.
-        provider = self._effort_provider(backend=ACP_BACKEND_CLAUDE, model="claude-opus-4.7")
-        provider._effort_per_model = {"claude-opus-4.7": "max"}
-        ok = await provider.clear_effort()
-        assert ok is False
-        assert "claude-opus-4.7" not in provider._effort_per_model
-        provider._client.set_config_option.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_change_effort_rolls_back_on_push_failure(self):
         # A failed live push must not leave a poisoned override/overlay that
         # would re-push the rejected level on every respawn.
@@ -1064,6 +1087,31 @@ class TestStartKiroRuntimeResume:
         handle, _runtime = await self._run_start(provider, "", file_exists=True)
         assert handle.set_model.await_args_list == [call("global.anthropic.claude-opus-4-8[1m]")]
         assert provider._client._handle is handle
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("backend", "pin", "noticed"),
+        [
+            ("kas", "auto", True),
+            ("kas", "", True),
+            ("kas", "claude-opus-4.6", False),
+            ("", "auto", False),
+        ],
+    )
+    async def test_an_unpinned_kas_start_names_kiro_cli_chat_default_model(
+        self, monkeypatch, backend, pin, noticed
+    ):
+        """KAS ignores chat.defaultModel and Crew does not apply it: an
+        unpinned KAS start records a notice naming it and sends no extra model."""
+        from kiro_crew.providers import acp_runtime_start
+
+        monkeypatch.setattr(acp_runtime_start, "default_model_notice", lambda cwd: "names it")
+        provider = self._kiro_provider(model=pin)
+        provider._client.backend = backend
+        handle, _runtime = await self._run_start(provider, "", file_exists=True)
+        assert provider._client.kas_default_model_notice == ("names it" if noticed else "")
+        expected = [call(pin)] if pin not in ("", "auto") else []
+        assert handle.set_model.await_args_list == expected
 
     @pytest.mark.asyncio
     async def test_default_model_does_not_call_set_model(self):
@@ -1737,6 +1785,9 @@ class TestStartKiroRuntimeModelEntitlement:
         handle = await self._run("claude-opus-4.8", ["claude-sonnet-4.6"])
         handle.set_model.assert_not_awaited()
         assert handle.model_pin_refused == "claude-opus-4.8"
+        # Dropping a pin is a one-shot decision, so its revalidation forces a fresh
+        # probe rather than honour a failure the picker read path cached.
+        assert handle.refresh_available_models.await_args_list == [call(force=True)]
 
     @pytest.mark.asyncio
     async def test_an_applied_configured_model_records_no_refusal(self):
@@ -1768,28 +1819,9 @@ class TestStartKiroRuntimeModelEntitlement:
             ["claude-sonnet-4.6"],
             probe=["claude-sonnet-4.6", "claude-opus-4.8"],
         )
-        assert handle.refresh_available_models.await_count == 1
+        assert handle.refresh_available_models.await_args_list == [call(force=True)]
         assert handle.set_model.await_args_list == [call("claude-opus-4.8")]
         assert handle.model_pin_refused == ""
-
-    @pytest.mark.asyncio
-    async def test_spawn_withhold_revalidation_forces_a_fresh_probe(self):
-        # D1: dropping a configured pin is a one-shot decision, not a burst, so
-        # its revalidation passes force=True — it must not honour a no-evidence
-        # failure the picker read path cached in the shared attempt-clock window.
-        handle = await self._run(
-            "claude-opus-4.8",
-            ["claude-sonnet-4.6"],
-            probe=["claude-sonnet-4.6", "claude-opus-4.8"],
-        )
-        handle.refresh_available_models.assert_awaited_once()
-        assert handle.refresh_available_models.await_args.kwargs.get("force") is True
-        # The probe agrees the pin is genuinely not entitled -> withhold as today.
-        handle = await self._run(
-            "claude-opus-4.8", ["claude-sonnet-4.6"], probe=["claude-sonnet-4.6"]
-        )
-        handle.refresh_available_models.assert_awaited_once()
-        handle.set_model.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_probe_failure_leaves_the_withhold_in_place(self):

@@ -6,7 +6,7 @@ import { sendTurn, SEND_ABORT_MS, type SendReceipt } from '../../chat-core/trans
 import { sendFailureCopy, deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
 import { sideTurnWire } from './sideTurnWire'
 import { useAppSelector, useAppDispatch, useAppStore } from '../../store'
-import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideQueueDroppedByResyncThenClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
+import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, noteSideQueueCancelWaiting, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideQueueDroppedByResyncThenClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -158,6 +158,16 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   // for a user who looks back after the TTL, and the text would be resent.
   // Lives in the store, per slot, beside the text it explains (see SideState.sendStatus).
   const sendStatus = reduxSide?.sendStatus
+  // Another tab's Refresh context closed this conversation while this tab showed it.
+  // Kept outside the slot's side state, which `sideClose` dropped.
+  const closedElsewhere = useAppSelector(s => s.chat.slotSideClosedElsewhere?.[slot] === true)
+
+  // The error of a failed cancel, edit or Stop belongs to the conversation another
+  // tab closed. Left in place it outranks the status strip and would hide the
+  // closed-in-another-tab line for as long as that line lasts.
+  useEffect(() => {
+    if (closedElsewhere) setLocalError(null)
+  }, [closedElsewhere])
 
   // Retire the transient notice on its own so it cannot outlive the moment it
   // describes.
@@ -641,7 +651,10 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   const cancelQueued = useMutation({
     mutationFn: ({ queueId, slot: target }: { queueId: string; slot: string }) =>
       api.sideQueueCancel(target, queueId),
-    onMutate: ({ queueId }: { queueId: string; slot: string }) => { markQueuePending(queueId, true) },
+    onMutate: ({ queueId, slot: target }: { queueId: string; slot: string }) => {
+      markQueuePending(queueId, true)
+      noteSideQueueCancelWaiting(target, queueId, true)
+    },
     onSuccess: (res, { queueId, slot: target }) => {
       // The reducer stashes the released text and the effect above drains it, so
       // on an open slot this path and the WS frame share ONE release — restoring
@@ -687,7 +700,10 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
     onError: () => {
       setLocalError(i18nT('pages.chat.sideChat.queue_cancel_failed'))
     },
-    onSettled: (_d, _e, { queueId }) => { markQueuePending(queueId, false) },
+    onSettled: (_d, _e, { queueId, slot: target }) => {
+      markQueuePending(queueId, false)
+      noteSideQueueCancelWaiting(target, queueId, false)
+    },
   })
 
   const editQueued = useMutation({
@@ -1028,11 +1044,12 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       {!displayError && lengthHint && (
         <div className="px-3 py-1 text-[12px] text-warn border-t border-border" role="status" data-testid="side-chat-length-hint">{lengthHint}</div>
       )}
-      {!displayError && !lengthHint && (sendStatus?.notice || localNotice) && (
+      {!displayError && !lengthHint && (sendStatus?.notice || localNotice || closedElsewhere) && (
         // The standing unconfirmed notice carries a decision ("check the
         // conversation above before sending it again"), so it reads at body
-        // weight; the transient demote notice keeps the muted strip.
-        <div className={`px-3 py-1 text-[12px] border-t border-border ${sendStatus?.notice ? 'text-text' : 'text-muted'}`} role="status">{sendStatus?.notice?.text ?? localNotice}</div>
+        // weight; the transient demote notice and the note that another tab
+        // cleared the conversation keep the muted strip.
+        <div className={`px-3 py-1 text-[12px] border-t border-border ${sendStatus?.notice ? 'text-text' : 'text-muted'}`} role="status">{sendStatus?.notice?.text ?? localNotice ?? i18nT('pages.chat.sideChat.closed_in_another_tab')}</div>
       )}
       {queueCards.length > 0 && (
         <div className="shrink-0 pt-1">

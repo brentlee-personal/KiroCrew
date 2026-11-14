@@ -643,6 +643,8 @@ class _SshTunnel:
         """Await the child's exit; on unexpected exit mark ERROR and notify."""
         proc = self._proc
         if proc is None:
+            # Nothing to supervise: the tunnel loses its monitor here, so say so.
+            logger.info("Tunnel monitor for %s has no child process to watch", self._id)
             return
         try:
             await proc.wait()
@@ -764,9 +766,14 @@ class _SshTunnel:
             )
         hit = _first_hit(low, _SSM_TARGET_SIGNALS)
         if hit is not None:
+            # StartSession answers a terminated target and an offline agent
+            # with the same error, so the message names both causes and points
+            # at Diagnose, whose ladder tells them apart.
             return (
                 "the SSM target is not a connected managed node (is the instance "
-                f"running with the SSM agent online and an instance profile?): "
+                "running with the SSM agent online and an instance profile? If it "
+                "was terminated or replaced, for example by an Auto Scaling instance "
+                "refresh, set SSM target to its new id; Diagnose shows which): "
                 f"{_sanitize_banner(tail, anchor=hit)}"
             )
         hit = _first_hit(low, _SSM_BIND_SIGNALS)
@@ -947,12 +954,13 @@ class _SshTunnel:
         proc = self._proc
         if proc is None or proc.stderr is None:
             return
-        with contextlib.suppress(Exception):
-            data = await proc.stderr.read()
-            if data:
-                self._stderr_buf = (self._stderr_buf + data.decode("utf-8", "replace"))[
-                    -_MAX_STDERR_CHARS:
-                ]
+        # Bounded like the drain above: a helper the child spawned (an ssh
+        # ProxyCommand) can outlive the kill and hold the write end open, and an
+        # unbounded read then never sees EOF -- the caller is ``_monitor``, so
+        # the exit would never be reported and self-heal would never run. The
+        # spawn-time drain reads in chunks, so whatever arrives in time is kept.
+        drain = asyncio.ensure_future(self._drain_stderr())
+        await self._retire_drain(drain, _STDERR_DRAIN_GRACE_SECS)
 
     async def stop(self) -> None:
         """Tear down this tunnel (graceful terminate then kill).

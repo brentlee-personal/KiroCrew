@@ -30,7 +30,7 @@ from kiro_crew.cloud.login_target import (
     target_from_whoami,
 )
 from kiro_crew.deploy.engine import resolve_aws_bin
-from kiro_crew.sandbox import SandboxCeilingUnsealable
+from kiro_crew.sandbox import SandboxCeilingUnsealable, SandboxUnavailableError
 from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import ValidationError
 
@@ -182,7 +182,9 @@ def _cloud_status(args: argparse.Namespace) -> int:
         return 0
     ui.note(f"{ui.BOLD}{tag}{ui.RESET}")
     ui.detail(f"stack:    {st.get('stack_name', '')} ({st.get('stack_status', '')})")
-    ui.detail(f"instance: {st.get('instance_id', '')} [{st.get('instance_state', '?')}]")
+    ui.detail(
+        f"instance: {st.get('instance_id') or '(id unknown)'} [{st.get('instance_state', '?')}]"
+    )
     ui.detail(f"region:   {st.get('region', region)}")
     return 0
 
@@ -401,7 +403,8 @@ def _cloud_destroy(args: argparse.Namespace) -> int:
 
     ui.warn(f"This will PERMANENTLY delete the '{tag}' stack and everything in it:")
     ui.detail(
-        f"instance {st.get('instance_id', '')}, its IAM role, security group, and EBS volume."
+        f"instance {st.get('instance_id') or '(id unknown)'}, its IAM role, security group, "
+        "and EBS volume."
     )
     ui.detail("Any data on the instance is lost. This cannot be undone.")
     if not getattr(args, "yes", False):
@@ -472,7 +475,10 @@ def _cloud_destroy(args: argparse.Namespace) -> int:
         ui.warn(f"Removed the stack, but could not clear the saved pointer to it: {exc}")
         ui.detail("The pointer is stale, not harmful: `kirocrew cloud list` shows what exists.")
 
-    ui.ok(f"Removed '{tag}' — all AWS resources deleted. You won't be billed for it.")
+    if src.get("removed"):
+        ui.ok(f"Removed '{tag}' — all AWS resources deleted. You won't be billed for it.")
+    else:
+        ui.ok(f"Removed the '{tag}' stack. Only the source object above may remain.")
     return 0
 
 
@@ -755,6 +761,19 @@ def handle_cloud(args: argparse.Namespace) -> int:
         # handler prints ANY builder of the exception, including ones in modules it does
         # not own, and ``ui.fail`` writes straight to the terminal. Escaping at each
         # builder keeps a new SINK safe; escaping at the sink keeps a new BUILDER safe.
+        ui.fail(safe_terminal_line(str(exc)))
+        return 1
+    except SandboxUnavailableError as exc:
+        # No OS-level sandbox backend on this host, so wrap_argv fail-closed
+        # before the very first `aws` call the launch path makes (every cloud
+        # verb runs its CLI through cloud.aws.run_aws -> wrap_argv). The spawn
+        # cannot be safely isolated and the sandbox requirement stands -- cloud
+        # launch still refuses -- but the refusal must read as the clean,
+        # host-setup one-liner the sibling sandbox errors print, not a raw
+        # traceback. Caught for the whole dispatch table, like
+        # SandboxCeilingUnsealable above: any verb reaching run_aws can raise it.
+        # safe_terminal_line because the message carries host-diagnostic probe
+        # text (a filename, an errno) written straight to the terminal.
         ui.fail(safe_terminal_line(str(exc)))
         return 1
     except CloudActionDenied as exc:

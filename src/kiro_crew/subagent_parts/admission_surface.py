@@ -300,6 +300,7 @@ def spawn(
     target_member: str | None = None,
     delegation: dict[str, str] | None = None,
     backend: str | None = None,
+    failover_from: str | None = None,
     label: str = "",
     _execution_context: dict | None = None,
     _parent_spawn_policy: "ParentSpawnPolicy | None" = None,
@@ -309,6 +310,7 @@ def spawn(
     _stop_before_memory_read: bool = False,
     _memory_reading: "tuple[float, str] | None" = None,
     _depth: int | None = None,
+    _root_session_key: str | None = None,
 ) -> SubagentInfo | None:
     result = self._admission.spawn_impl(
         task,
@@ -345,6 +347,7 @@ def spawn(
         target_member=target_member,
         delegation=delegation,
         backend=backend,
+        failover_from=failover_from,
         label=label,
         _execution_context=_execution_context,
         _parent_spawn_policy=_parent_spawn_policy,
@@ -354,6 +357,7 @@ def spawn(
         _stop_before_memory_read=_stop_before_memory_read,
         _memory_reading=_memory_reading,
         _depth=_depth,
+        _root_session_key=_root_session_key,
     )
     assert not isinstance(result, PreparedSpawn)
     # Every synchronous gate return (started, queued, or refused) receives

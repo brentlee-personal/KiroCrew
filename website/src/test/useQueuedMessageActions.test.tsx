@@ -35,6 +35,7 @@ const deferred = () => {
 const apiMocks = vi.hoisted(() => ({
   cancelQueuedMessage: vi.fn(),
   editQueuedMessage: vi.fn(),
+  holdQueuedMessageEdit: vi.fn(),
   interruptSlot: vi.fn(),
   reorderQueuedMessages: vi.fn(),
 }))
@@ -322,6 +323,29 @@ describe('useQueuedMessageActions — edit', () => {
     const card = (store.getState() as RootState).chat.messages.find(m => m.meta?.queueId === 'q1')
     expect(card?.content).toBe('run the tests')
   })
+
+  // The server releases the editor's hold only once it stores the edit, so a
+  // refused save releases it here; a stored one sends no release beside it.
+  it('releases the editor hold when the save is refused, and only then', async () => {
+    const { get } = renderActions({})
+    await act(async () => { get().onEdit('q1', 'stored edit') })
+    expect(apiMocks.holdQueuedMessageEdit).not.toHaveBeenCalled()
+    apiMocks.editQueuedMessage.mockRejectedValueOnce(new Error('409'))
+    await act(async () => { get().onEdit('q1', 'refused edit') })
+    await waitFor(() => expect(apiMocks.holdQueuedMessageEdit).toHaveBeenCalledWith('chat-1', 'q1', false))
+  })
+
+  // A close must not reach the server before its own open, or the late open
+  // installs a hold no editor owns.
+  it('sends a card close only after its open has finished', async () => {
+    let finishOpen: (v: unknown) => void = () => {}
+    apiMocks.holdQueuedMessageEdit.mockImplementationOnce(() => new Promise(r => { finishOpen = r }))
+    const { get } = renderActions({})
+    act(() => { get().onEditOpen('q1', true); get().onEditOpen('q1', false) })
+    expect(apiMocks.holdQueuedMessageEdit.mock.calls).toEqual([['chat-1', 'q1', true]])
+    await act(async () => { finishOpen({ ok: true }) })
+    await waitFor(() => expect(apiMocks.holdQueuedMessageEdit.mock.calls).toEqual([['chat-1', 'q1', true], ['chat-1', 'q1', false]]))
+  })
 })
 
 describe('useQueuedMessageActions — interrupt', () => {
@@ -392,6 +416,18 @@ describe('useQueuedMessageActions — in-flight latch (#5891 item 2)', () => {
     act(() => { get().onInterrupt('q2') })
     await waitFor(() => expect(get().pendingIds.has('q2')).toBe(true))
     await act(async () => { d.reject(new Error('offline')); await d.promise.catch(() => undefined) })
+    await waitFor(() => expect(get().pendingIds.has('q2')).toBe(false))
+  })
+
+  it('releases an interrupt the server declined to select, since that card stays queued', async () => {
+    // A second "run now" while another stop owns the slot answers 200 without
+    // promoting the card. No row retires, so a latch would never release.
+    const d = deferred()
+    apiMocks.interruptSlot.mockReturnValue(d.promise)
+    const { get } = renderActions({})
+    act(() => { get().onInterrupt('q2') })
+    await waitFor(() => expect(get().pendingIds.has('q2')).toBe(true))
+    await act(async () => { d.resolve({ ok: true, info: 'stop already in progress', queue_selected: false }) })
     await waitFor(() => expect(get().pendingIds.has('q2')).toBe(false))
   })
 

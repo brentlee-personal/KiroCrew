@@ -75,6 +75,13 @@ function noteSideQueueCardsDroppedByClose(slot: string, entries: readonly SideQu
   })))
 }
 
+/** A new side conversation begins in the slot, so neither the closed sentinel nor
+ *  the mark that another tab closed the last one applies any more. */
+function reopenClosedSide(state: ChatState, slot: string): void {
+  if (state.slotSideClosed) delete state.slotSideClosed[slot]
+  if (state.slotSideClosedElsewhere) delete state.slotSideClosedElsewhere[slot]
+}
+
 function takeSideQueueCardDroppedByClose(
   slot: string,
   matches: (card: SideQueueCardDroppedByClose) => boolean,
@@ -104,6 +111,26 @@ export function takeSideSteerDroppedByClose(slot: string, steerId: string): bool
 type SideQueueCardDroppedByResync = { content: string; raw: boolean }
 const sideQueueCardsDroppedByResync = new Map<string, Map<string, SideQueueCardDroppedByResync>>()
 
+/** How many cancels this tab sent for each queue id and has not heard back on. That
+ *  answer is the only thing left to hand a dropped card's text back, so until it
+ *  lands the card's record is neither evicted nor dropped by a later close. A count,
+ *  because a remounted panel can send a second cancel while the first still waits. */
+const sideQueueCancelsWaiting = new Map<string, Map<string, number>>()
+
+/** Mark this tab's cancel of a queue card as waiting for its answer, or settled. */
+export function noteSideQueueCancelWaiting(slot: string, queueId: string, waiting: boolean): void {
+  const perSlot = sideQueueCancelsWaiting.get(slot) ?? new Map<string, number>()
+  const count = (perSlot.get(queueId) ?? 0) + (waiting ? 1 : -1)
+  if (count > 0) perSlot.set(queueId, count)
+  else perSlot.delete(queueId)
+  if (perSlot.size) sideQueueCancelsWaiting.set(slot, perSlot)
+  else sideQueueCancelsWaiting.delete(slot)
+}
+
+function cancelWaits(slot: string, queueId: string): boolean {
+  return !!sideQueueCancelsWaiting.get(slot)?.has(queueId)
+}
+
 function noteSideQueueDroppedByResync(slot: string, entries: readonly SideQueueEntry[]): void {
   if (entries.length === 0) return
   const dropped = sideQueueCardsDroppedByResync.get(slot) ?? new Map<string, SideQueueCardDroppedByResync>()
@@ -111,7 +138,10 @@ function noteSideQueueDroppedByResync(slot: string, entries: readonly SideQueueE
     dropped.delete(entry.id)
     dropped.set(entry.id, { content: entry.content, raw: entry.raw === true })
   }
-  while (dropped.size > MAX_RETIRED_QUEUE_IDS) dropped.delete(dropped.keys().next().value as string)
+  for (const id of dropped.keys()) {
+    if (dropped.size <= MAX_RETIRED_QUEUE_IDS) break
+    if (!cancelWaits(slot, id)) dropped.delete(id)
+  }
   sideQueueCardsDroppedByResync.set(slot, dropped)
 }
 
@@ -130,12 +160,18 @@ function takeSideQueueDroppedByResync(slot: string, queueId: string): SideQueueC
  *  live record so a later conversation's frames never consult it. */
 const sideQueueCardsDroppedByResyncThenClosed = new Map<string, Map<string, SideQueueCardDroppedByResync>>()
 
-/** Replaces, never merges: each close describes only the conversation it ended,
- *  so a card from an earlier one cannot answer a cancel after a later close. */
+/** Each close keeps only the cards whose cancel from this tab still waits for its
+ *  answer, the one reader of this record. The gateway mints queue ids at random, so
+ *  a card kept from an earlier conversation cannot match one of a later one. */
 function keepSideQueueDroppedByResyncAcrossClose(slot: string): void {
-  const dropped = sideQueueCardsDroppedByResync.get(slot)
+  const kept = new Map<string, SideQueueCardDroppedByResync>()
+  for (const record of [sideQueueCardsDroppedByResyncThenClosed.get(slot), sideQueueCardsDroppedByResync.get(slot)]) {
+    for (const [id, card] of record ?? []) {
+      if (cancelWaits(slot, id)) kept.set(id, card)
+    }
+  }
   sideQueueCardsDroppedByResync.delete(slot)
-  if (dropped) sideQueueCardsDroppedByResyncThenClosed.set(slot, dropped)
+  if (kept.size) sideQueueCardsDroppedByResyncThenClosed.set(slot, kept)
   else sideQueueCardsDroppedByResyncThenClosed.delete(slot)
 }
 
@@ -222,13 +258,29 @@ export function queueEditBroadcastAt(slot: string, queueId: string): number {
   return queueEditBroadcasts.get(slot)?.get(queueId) ?? 0
 }
 
+/** A side state that a frame, a send status or a question this tab sends makes.
+ *  Its banner baseline is the main chat's turn count this tab holds now, but only
+ *  when that count is the slot's: while another slot is shown, or while this slot's
+ *  own switch is still loading its transcript, `state.messages` is not this slot's
+ *  history, and a count taken then (0 for an uncached slot) makes the banner count
+ *  every turn that loads later as newer. Such a state counts the parent turns newer
+ *  than its start instead, as a restored conversation does. */
+function newSideState(state: ChatState, slot: string, createdAt: string): SideState {
+  const loading = state.slotSwitchRequestId != null && state.slotSwitchTarget === slot
+  if (slot !== state.activeSlot || loading) {
+    return { messages: [], openedAtTurnCount: 0, createdAt, countsTurnsSinceCreated: true }
+  }
+  const openedAtTurnCount = (state.messages ?? []).filter(m => m.role === 'user' || m.role === 'assistant').length
+  return { messages: [], openedAtTurnCount, createdAt }
+}
+
 /** A side state with no rows and no queue holds no conversation yet, even when a
  *  queue frame, a send status or a read with no rows made it earlier. Its first row
  *  starts one: its age starts at that row, and the banner counts the main chat's
  *  turns newer than the row, as for a restored conversation. The turns this tab
  *  holds when the row lands cannot be the baseline, because the tab can be showing
- *  another slot or still loading this one. A state its first row makes is not one
- *  of these: it is stamped when it is made, as before. */
+ *  another slot or still loading this one. A state its first row makes is stamped
+ *  when it is made, by `newSideState`. */
 function startConversationIfEmpty(side: SideState, ts: string): void {
   if (side.messages.length || side.queue?.length) return
   side.createdAt = ts
@@ -416,16 +468,13 @@ export const sideReducers = {
     if (steer && state.slotSideClosed[slot]) return
     // Intentional re-open (new user frame) clears the closed sentinel
     if (role === 'user' && state.slotSideClosed[slot]) {
-      delete state.slotSideClosed[slot]
+      reopenClosedSide(state, slot)
     }
     // Block late assistant chunks after sideClose
     if (!state.slotSide[slot] && state.slotSideClosed[slot]) return
     const madeEarlier = !!state.slotSide[slot]
     if (!state.slotSide[slot]) {
-      const parentTurnCount = slot === state.activeSlot
-        ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
-        : 0
-      state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: tsIso }
+      state.slotSide[safeKey(slot)] = newSideState(state, slot, tsIso)
     }
     const side: SideState = state.slotSide[slot]
     // A row this panel already holds: the restore read it after this frame left
@@ -544,12 +593,9 @@ export const sideReducers = {
       // An edit for an entry this tab has no card for matters only while the
       // restore read is in flight: see the `at < 0` branch below.
       if (state.slotSideClosed[slot] || (kind === 'edit' && !state.slotSideReading?.[slot])) return
-      const parentTurnCount = slot === state.activeSlot
-        ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
-        : 0
       // A terminal frame or an edit can beat the restore read. Keep only the same
       // empty shell SideChat already renders for absent state, plus what it said.
-      state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: new Date().toISOString() }
+      state.slotSide[safeKey(slot)] = newSideState(state, slot, new Date().toISOString())
     }
     const side: SideState = state.slotSide[slot]
     const queue = side.queue
@@ -695,12 +741,9 @@ export const sideReducers = {
     // path too, whose test stores seed only the fields they exercise.
     if (!state.slotSide?.[slot]) {
       if (error == null && notice == null) return
-      if (state.slotSideClosed) delete state.slotSideClosed[slot]
-      const parentTurnCount = slot === state.activeSlot
-        ? (state.messages ?? []).filter(m => m.role === 'user' || m.role === 'assistant').length
-        : 0
+      reopenClosedSide(state, slot)
       state.slotSide ??= {}
-      state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: new Date().toISOString() }
+      state.slotSide[safeKey(slot)] = newSideState(state, slot, new Date().toISOString())
     }
     const side = state.slotSide[slot]
     const next: SideSendStatus = { ...side.sendStatus }
@@ -728,18 +771,27 @@ export const sideReducers = {
     const slot = action.payload
     if (isUnsafeKey(slot)) return
     noteSideQueueCardsDroppedByClose(slot, state.slotSide[slot]?.queue?.filter(entry => !entry.raw) ?? [])
-    // Queue ids are unique only within one conversation, so what a re-read dropped
-    // from this one must not answer a cancel in the next. It moves to a record only
-    // this tab's own cancel answer reads. A close of a slot already closed (the
+    // What a re-read dropped from this conversation moves to a record only this
+    // tab's own cancel answer reads. A close of a slot already closed (the
     // gateway's frame for a close this tab made) leaves that record as it is.
     if (!state.slotSideClosed[slot]) keepSideQueueDroppedByResyncAcrossClose(slot)
     delete state.slotSide[slot]
     state.slotSideClosed[safeKey(slot)] = true
+    if (state.slotSideClosedElsewhere) delete state.slotSideClosedElsewhere[slot]
     // Closed here, so this page knows the gateway holds nothing for the slot: a
     // restore read still in flight describes the conversation just closed.
     state.slotSideRestored ??= {}
     state.slotSideRestored[safeKey(slot)] = true
     if (state.slotSideReading) delete state.slotSideReading[slot]
+  },
+  /** Another tab closed the slot's side conversation while this tab showed it or held
+   *  one of its questions, so the panel says why it emptied. Applies only to a slot
+   *  `sideClose` closed, which is why it is dispatched after it. */
+  sideClosedElsewhere(state: ChatState, action: PayloadAction<string>) {
+    const slot = action.payload
+    if (isUnsafeKey(slot) || !state.slotSideClosed?.[slot]) return
+    state.slotSideClosedElsewhere ??= {}
+    state.slotSideClosedElsewhere[safeKey(slot)] = true
   },
   /** A restore read of the slot's side conversation started (`reading: true`), or
    *  failed (`reading: false`). Only while one is in flight does the panel keep an
@@ -841,13 +893,10 @@ export const sideReducers = {
   sideOptimisticAppend(state: ChatState, action: PayloadAction<{ slot: string; message: SideMessage }>) {
     const { slot, message } = action.payload
     if (isUnsafeKey(slot)) return
-    if (state.slotSideClosed[slot]) delete state.slotSideClosed[slot]
+    reopenClosedSide(state, slot)
     const madeEarlier = !!state.slotSide[slot]
     if (!state.slotSide[slot]) {
-      const parentTurnCount = slot === state.activeSlot
-        ? state.messages.filter(m => m.role === 'user' || m.role === 'assistant').length
-        : 0
-      state.slotSide[safeKey(slot)] = { messages: [], openedAtTurnCount: parentTurnCount, createdAt: message.ts }
+      state.slotSide[safeKey(slot)] = newSideState(state, slot, message.ts)
     }
     const side = state.slotSide[slot]
     if (madeEarlier) startConversationIfEmpty(side, message.ts)

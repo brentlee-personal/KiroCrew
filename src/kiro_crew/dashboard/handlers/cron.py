@@ -67,6 +67,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _MAX_CRON_BODY_BYTES,
         _T,
         _ChatFolderGone,
+        _invalid_new_chat_per_run,
         _member_store,
         _persist_holding_folder,
         _refuse_mate_home_chat_folder,
@@ -94,6 +95,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _LESSON_EMBED_DEADLINE_SECS,
         _candidate_applies,
         _embed_lesson_bounded,
+        _is_operator_browser,
         _lesson_jsonl_store,
         _lesson_list_page,
         _lesson_scope_selector,
@@ -103,9 +105,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_lessons,
         api_lessons_create,
         api_lessons_delete,
+        api_lessons_update,
     )
     from kiro_crew.dashboard.handlers.cron_runs import (  # noqa: F401
         _HISTORY_PAGE_MAX,
+        _ack_job,
         _history_page,
         api_cron_ack,
         api_cron_cancel,
@@ -123,8 +127,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.dashboard.handlers.cron_secret_grants import (  # noqa: F401
         _SHA256_HEX_RE,
+        _expected_ts_value,
         _is_str_mapping,
         _promote_pending_grant,
+        _unrepresentable_ts_response,
         api_cron_secret_grant,
     )
     from kiro_crew.dashboard.handlers.cron_shared import (  # noqa: F401
@@ -190,6 +196,12 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         prefetch_cron_dismissed,
         restore_cron_turn_timeout,
     )
+    from kiro_crew.dashboard.cron_note_ack import (  # noqa: F401
+        cron_item_already_recorded,
+        cron_note_transition,
+        mark_cron_item_recorded,
+        new_ack_id,
+    )
     from kiro_crew.dashboard.cron_timeout_field import (  # noqa: F401
         timeout_secs_from_body,
     )
@@ -227,6 +239,13 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.hooks import (  # noqa: F401
         FileTooLargeError,
         safe_read_file_bytes_nolink,
+    )
+    from kiro_crew.lesson_events import (  # noqa: F401
+        LESSON_REMOVED,
+        LESSON_SOURCE_USER,
+        LESSON_UPDATED,
+        emit_lessons_changed,
+        lesson_write_action,
     )
     from kiro_crew.lesson_validation import (  # noqa: F401
         LESSON_APPLIES_ON_TOPIC,
@@ -268,6 +287,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         CHANNEL_MAX_LEN,
         CRON_ADD_SCHEMA,
         LEARN_ADD_SCHEMA,
+        LEARN_UPDATE_SCHEMA,
         LESSON_LIST_LIMIT,
         LESSON_LIST_LIMIT_MAX,
         MAX_CRON_MESSAGE,
